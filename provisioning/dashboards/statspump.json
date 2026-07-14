@@ -1,0 +1,73 @@
+{
+  "uid": "mqtt-statspump",
+  "title": "MQTT StatsPump (live)",
+  "tags": ["mqtt", "statspump"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "",
+  "time": { "from": "now-5m", "to": "now" },
+  "timepicker": {
+    "quick_ranges": [
+      { "display": "Last 1 minute", "from": "now-1m", "to": "now" },
+      { "display": "Last 2 minutes", "from": "now-2m", "to": "now" },
+      { "display": "Last 5 minutes", "from": "now-5m", "to": "now" },
+      { "display": "Last 15 minutes", "from": "now-15m", "to": "now" },
+      { "display": "Last 30 minutes", "from": "now-30m", "to": "now" },
+      { "display": "Last 1 hour", "from": "now-1h", "to": "now" },
+      { "display": "Last 3 hours", "from": "now-3h", "to": "now" },
+      { "display": "Last 6 hours", "from": "now-6h", "to": "now" },
+      { "display": "Last 12 hours", "from": "now-12h", "to": "now" },
+      { "display": "Last 24 hours", "from": "now-24h", "to": "now" }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "pollerA — nested stats (field selection)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "showPoints": "never" } }, "overrides": [] },
+      "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+          "topic": "pump/system/pollerA",
+          "fields": ["stats.totalTimeMs", "stats.objectCount"]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "message-spool — stats.elementCount",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "showPoints": "never" } }, "overrides": [] },
+      "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+          "topic": "pump/system/message-spool",
+          "fields": ["stats.elementCount", "stats.charCount"]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "pollerA — classic mode (no field selection): only top-level keys, nested stats stays a JSON blob → why field selection exists",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-mqtt-datasource", "uid": "mqtt-dev" },
+          "topic": "pump/system/pollerA"
+        }
+      ]
+    }
+  ]
+}

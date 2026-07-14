@@ -1,0 +1,22 @@
+# Local dev override (auto-merged by docker compose).
+#
+# Runs the StatsPump fixture broker as a service on the same Docker network as
+# Grafana, so the plugin connects to it by service name (tcp://broker:1884) with no
+# host.docker.internal / host-networking involved. Robust and portable.
+#
+# (To point at a broker running on the HOST instead — e.g. real Solace/StatsPump on
+# the host's :1883 — drop this broker service and set the datasource URI to
+# tcp://host.docker.internal:1883, ensuring that broker listens dual-stack.)
+services:
+  broker:
+    image: node:24-alpine
+    working_dir: /work
+    volumes:
+      - .:/work
+    command: node scripts/statspump_broker.js
+    environment:
+      MQTT_PORT: '1884'
+
+  grafana:
+    depends_on:
+      - broker
