@@ -50,9 +50,14 @@ func TestStreamingKeyIntegration_TopicUniqueness(t *testing.T) {
 		RefID:    "C",
 	}
 
-	// Create datasource instance
+	// Create datasource instance with a mock client (QueryData now seeds from the
+	// client's ring buffer, so a client must be present).
 	ds := &MQTTDatasource{
 		channelPrefix: "ds/test-uid",
+		Client: &mockMQTTClient{
+			topics:        make(map[string]*mqtt.Topic),
+			subscriptions: make(map[string]bool),
+		},
 	}
 
 	// Process queries
@@ -229,6 +234,14 @@ type mockMQTTClient struct {
 func (m *mockMQTTClient) GetTopic(reqPath string) (*mqtt.Topic, bool) {
 	topic, found := m.topics[reqPath]
 	return topic, found
+}
+
+func (m *mockMQTTClient) EnsureTopic(t *mqtt.Topic) *mqtt.Topic {
+	if existing, ok := m.topics[t.Key()]; ok {
+		return existing
+	}
+	m.topics[t.Key()] = t
+	return t
 }
 
 func (m *mockMQTTClient) IsConnected() bool {

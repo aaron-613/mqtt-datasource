@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"math/rand"
-	"path"
 	"strings"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 
 type Client interface {
 	GetTopic(string) (*Topic, bool)
+	EnsureTopic(*Topic) *Topic
 	IsConnected() bool
 	Subscribe(string, log.Logger) (*Topic, error)
 	Unsubscribe(string, log.Logger) error
@@ -34,9 +34,19 @@ type Options struct {
 	TLSSkipVerify bool   `json:"tlsSkipVerify"`
 }
 
+// detachGracePeriod is how long a topic's ring buffer (and its MQTT subscription) is
+// retained after its last consumer detaches, so a re-query — e.g. a zoom, which tears
+// down and re-establishes the stream — can reseed recent history instead of blanking.
+// janitorInterval is how often abandoned topics are swept.
+const (
+	detachGracePeriod = 5 * time.Minute
+	janitorInterval   = 60 * time.Second
+)
+
 type client struct {
 	client paho.Client
 	topics TopicMap
+	done   chan struct{}
 }
 
 func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstanceSettings) (Client, error) {
@@ -103,9 +113,77 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 		return nil, backend.DownstreamErrorf("error connecting to MQTT broker: %s", token.Error())
 	}
 
-	return &client{
+	c := &client{
 		client: pahoClient,
-	}, nil
+		done:   make(chan struct{}),
+	}
+	go c.janitor()
+	return c, nil
+}
+
+// janitor periodically removes topics whose consumers have all detached for longer
+// than the grace period, closing their MQTT subscription and freeing the ring buffer.
+func (c *client) janitor() {
+	ticker := time.NewTicker(janitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.sweep()
+		}
+	}
+}
+
+func (c *client) sweep() {
+	type victim struct {
+		key    string
+		mqtt   string
+		hadSub bool
+	}
+	var victims []victim
+	c.topics.Range(func(key, v any) bool {
+		t, ok := v.(*Topic)
+		if !ok || t.stream == nil {
+			return true
+		}
+		t.stream.mu.Lock()
+		stale := t.stream.attachedCount == 0 && !t.stream.detachedAt.IsZero() &&
+			time.Since(t.stream.detachedAt) > detachGracePeriod
+		hadSub := t.stream.pahoSubscribed
+		t.stream.mu.Unlock()
+		if stale {
+			mqttTopic, err := decodeTopic(t.Path, log.DefaultLogger)
+			if err == nil {
+				victims = append(victims, victim{key: key.(string), mqtt: mqttTopic, hadSub: hadSub})
+			}
+		}
+		return true
+	})
+
+	for _, vv := range victims {
+		// Re-check under lock so a topic that re-attached since the scan is spared.
+		t, ok := c.topics.Load(vv.key)
+		if !ok || t.stream == nil {
+			continue
+		}
+		t.stream.mu.Lock()
+		stillStale := t.stream.attachedCount == 0 && !t.stream.detachedAt.IsZero() &&
+			time.Since(t.stream.detachedAt) > detachGracePeriod
+		if stillStale {
+			t.stream.pahoSubscribed = false
+		}
+		t.stream.mu.Unlock()
+		if !stillStale {
+			continue
+		}
+		if vv.hadSub {
+			c.client.Unsubscribe(vv.mqtt)
+		}
+		c.topics.Delete(vv.key)
+		log.DefaultLogger.Debug("janitor removed idle topic", "key", vv.key)
+	}
 }
 
 func (c *client) IsConnected() bool {
@@ -125,12 +203,24 @@ func (c *client) GetTopic(reqPath string) (*Topic, bool) {
 	return c.topics.Load(reqPath)
 }
 
-func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
-	// Check if there's already a topic with this exact key (reqPath)
-	if existingTopic, ok := c.topics.Load(reqPath); ok {
-		return existingTopic, nil
+// EnsureTopic registers a topic (with its field selection and buffer) if one does
+// not already exist for its key, without opening an MQTT subscription. QueryData
+// calls this so the ring buffer and framer are configured before streaming starts;
+// the returned topic is the live instance stored in the map.
+func (c *client) EnsureTopic(t *Topic) *Topic {
+	if existing, ok := c.topics.Load(t.Key()); ok {
+		// A topic may already exist without the right field selection (e.g. created by
+		// the RunStream fallback on a Live reconnect before QueryData ran). Reconcile it.
+		existing.reconcileFields(t.Fields)
+		return existing
 	}
+	stored := newStreamTopic(t.Path, t.Interval, t.Fields, t.Window)
+	stored.StreamingKey = t.StreamingKey
+	c.topics.Map.Store(t.Key(), stored)
+	return stored
+}
 
+func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 	chunks := strings.Split(reqPath, "/")
 	if len(chunks) < 2 {
 		return nil, backend.DownstreamErrorf("invalid path: %s", reqPath)
@@ -140,64 +230,92 @@ func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 		return nil, backend.DownstreamErrorf("invalid interval %s: %s", chunks[0], err)
 	}
 
-	// For MQTT subscription, we only need the actual topic path (without streaming key)
-	// The streaming key is used for topic uniqueness in storage, but MQTT only cares about the topic path
-	topicPath := path.Join(chunks[1:]...)
+	// Find an already-registered topic (usually created by QueryData via EnsureTopic),
+	// or create a default (classic, no field selection) one.
+	t, ok := c.topics.Load(reqPath)
+	if !ok {
+		// Path is ONLY the base64 topic segment (not the streaming-key suffix). Every
+		// topic subscribed to the same MQTT topic must share the same Path so that an
+		// incoming message fans out to all of them via TopicMap.AddMessage — otherwise,
+		// because paho keeps a single handler per topic filter, two panels on the same
+		// topic would starve one another.
+		//
+		// StreamingKey must also be set from the remaining segments so the topic's Key()
+		// equals reqPath and QueryData rebuilds a well-formed channel for it (otherwise
+		// SubscribeStream rejects the channel as "invalid channel path format").
+		topicPath := chunks[1]
+		t = newStreamTopic(topicPath, interval, nil, 0)
+		t.StreamingKey = strings.Join(chunks[2:], "/")
+		c.topics.Map.Store(reqPath, t)
+	}
 
-	// Create topic with the reqPath as the key for storage
-	// The actual topic components will be parsed when needed
-	t := &Topic{
-		Path:     topicPath,
-		Interval: interval,
+	// Register this consumer and open the MQTT subscription once per topic. The
+	// subscription and buffer are kept alive across detach so zoom re-queries reseed.
+	t.stream.mu.Lock()
+	t.stream.attachedCount++
+	t.stream.detachedAt = time.Time{}
+	needSubscribe := !t.stream.pahoSubscribed
+	t.stream.pahoSubscribed = true
+	t.stream.mu.Unlock()
+	if !needSubscribe {
+		return t, nil
+	}
+
+	revert := func() {
+		t.stream.mu.Lock()
+		t.stream.pahoSubscribed = false
+		if t.stream.attachedCount > 0 {
+			t.stream.attachedCount--
+		}
+		t.stream.mu.Unlock()
 	}
 
 	topic, err := decodeTopic(t.Path, logger)
 	if err != nil {
+		revert()
 		return nil, backend.DownstreamErrorf("error decoding MQTT topic name %s: %s", t.Path, err)
 	}
 
 	logger.Debug("Subscribing to MQTT topic", "topic", topic)
 
+	routePath := t.Path
 	if token := c.client.Subscribe(topic, 0, func(_ paho.Client, m paho.Message) {
-		// by wrapping HandleMessage we can directly get the correct topicPath for the incoming topic
+		// by wrapping HandleMessage we get the correct topicPath for the incoming topic
 		// and don't need to regex it against + and #.
-		c.HandleMessage(topicPath, []byte(m.Payload()))
+		c.HandleMessage(routePath, []byte(m.Payload()))
 	}); token.Wait() && token.Error() != nil {
+		revert()
 		return nil, backend.DownstreamErrorf("error subscribing to MQTT topic %s: %s", topic, token.Error())
 	}
-	// Store the topic using reqPath as the key (which includes streaming key)
-	c.topics.Map.Store(reqPath, t)
 	return t, nil
 }
 
-func (c *client) Unsubscribe(reqPath string, logger log.Logger) error {
+func (c *client) Unsubscribe(reqPath string, _ log.Logger) error {
 	t, ok := c.GetTopic(reqPath)
 	if !ok {
 		return nil // No error if topic doesn't exist
 	}
-	c.topics.Delete(t.Key())
 
-	if exists := c.topics.HasSubscription(t.Path); exists {
-		// There are still other subscriptions to this path,
-		// so we shouldn't unsubscribe yet.
-		return nil
+	// Detach this consumer but RETAIN the topic, its ring buffer, and the MQTT
+	// subscription so a re-query (e.g. a zoom, which tears down and re-establishes the
+	// stream) can reseed recent history instead of blanking. The janitor closes the
+	// subscription and frees the buffer once the topic stays detached past the grace
+	// period.
+	t.stream.mu.Lock()
+	if t.stream.attachedCount > 0 {
+		t.stream.attachedCount--
 	}
-
-	logger.Debug("Unsubscribing from MQTT topic", "topic", t.Path)
-
-	topic, err := decodeTopic(t.Path, logger)
-	if err != nil {
-		return backend.DownstreamErrorf("error decoding MQTT topic name %s: %s", t.Path, err)
+	if t.stream.attachedCount == 0 {
+		t.stream.detachedAt = time.Now()
 	}
-
-	if token := c.client.Unsubscribe(topic); token.Wait() && token.Error() != nil {
-		return backend.DownstreamErrorf("error unsubscribing from MQTT topic %s: %s", t.Path, token.Error())
-	}
-
+	t.stream.mu.Unlock()
 	return nil
 }
 
 func (c *client) Dispose() {
 	log.DefaultLogger.Info("MQTT Disconnecting")
+	if c.done != nil {
+		close(c.done)
+	}
 	c.client.Disconnect(250)
 }

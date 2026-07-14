@@ -9,8 +9,6 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-
-	"github.com/grafana/mqtt-datasource/pkg/mqtt"
 )
 
 func (ds *MQTTDatasource) RunStream(ctx context.Context, req *backend.RunStreamRequest, sender *backend.StreamSender) error {
@@ -54,12 +52,15 @@ func (ds *MQTTDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 				logger.Debug("topic not found", "path", req.Path, "topicKey", topicKey)
 				break
 			}
-			frame, err := topic.ToDataFrame(logger)
+			frame, hasData, err := topic.StreamDelta(logger)
 			if err != nil {
 				logger.Error("failed to convert topic to data frame", "path", req.Path, "error", backend.DownstreamError(err))
 				break
 			}
-			topic.Messages = []mqtt.Message{}
+			if !hasData {
+				// nothing new since the last tick
+				break
+			}
 			if err := sender.SendFrame(frame, data.IncludeAll); err != nil {
 				logger.Error("failed to send data frame", "path", req.Path, "error", backend.DownstreamError(err))
 			}

@@ -20,7 +20,7 @@ export class DataSource extends DataSourceWithBackend<MqttQuery, MqttDataSourceO
       Promise.all(
         request.targets.map(async (target) => ({
           ...target,
-          streamingKey: await getLiveStreamKey(this.uid, target.topic),
+          streamingKey: await getLiveStreamKey(this.uid, target.topic, target.fields),
         }))
       )
     ).pipe(

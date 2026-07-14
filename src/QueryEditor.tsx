@@ -1,10 +1,17 @@
 import React from 'react';
-import { Input, InlineFieldRow, InlineField } from '@grafana/ui';
+import { Input, InlineFieldRow, InlineField, TextArea } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { MqttDataSourceOptions, MqttQuery } from './types';
 
 type Props = QueryEditorProps<DataSource, MqttQuery, MqttDataSourceOptions>;
+
+// Parse the multi-line/comma-separated Fields input into a clean list of leaf paths.
+const parseFields = (raw: string): string[] =>
+  raw
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
 export const QueryEditor = (props: Props) => {
   const { query, onChange, onRunQuery } = props;
@@ -19,7 +26,26 @@ export const QueryEditor = (props: Props) => {
             placeholder='e.g. "home/bedroom/temperature"'
             value={query.topic}
             onBlur={onRunQuery}
-            onChange={(e) => onChange({...query, topic: e.currentTarget.value })}
+            onChange={(e) => onChange({ ...query, topic: e.currentTarget.value })}
+          />
+        </InlineField>
+      </InlineFieldRow>
+      <InlineFieldRow>
+        <InlineField
+          label="Fields"
+          labelWidth={8}
+          grow
+          tooltip="Optional. One JSON leaf path per line (dot notation, e.g. stats.totalTimeMs). Leave empty to graph every top-level key."
+        >
+          <TextArea
+            name="fields"
+            rows={3}
+            placeholder={'stats.totalTimeMs\nstats.objectCount'}
+            defaultValue={(query.fields ?? []).join('\n')}
+            onBlur={(e) => {
+              onChange({ ...query, fields: parseFields(e.currentTarget.value) });
+              onRunQuery();
+            }}
           />
         </InlineField>
       </InlineFieldRow>

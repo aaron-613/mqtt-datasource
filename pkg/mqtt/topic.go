@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"path"
 	"strings"
 	"sync"
@@ -11,33 +12,199 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
 
+// defaultWindow is how much recent history the ring buffer retains when a topic
+// doesn't specify its own window. maxBufferedMessages is a hard safety cap so a
+// fast/high-cardinality topic can't grow the buffer without bound.
+const (
+	defaultWindow       = 15 * time.Minute
+	maxBufferedMessages = 20000
+)
+
 type Message struct {
 	Timestamp time.Time
 	Value     []byte
 }
 
-// Topic represents a MQTT topic.
+// Topic represents a MQTT topic subscription.
 type Topic struct {
-	Path         string `json:"topic"`
-	StreamingKey string `json:"streamingKey,omitempty"`
-	Interval     time.Duration
-	Messages     []Message
-	framer       *framer
+	Path         string        `json:"topic"`
+	StreamingKey string        `json:"streamingKey,omitempty"`
+	Fields       []string      `json:"fields,omitempty"` // selected leaf paths (dot notation); empty = classic top-level extraction
+	Interval     time.Duration `json:"-"`
+	Window       time.Duration `json:"-"` // ring buffer retention window
+	Messages     []Message     `json:"-"` // retained ring buffer (also the source for streamed deltas)
+
+	// stream holds concurrency/buffering state. It is a pointer so Topic stays
+	// copyable (some tests copy Topic by value); it is created for topics the
+	// client manages for streaming.
+	stream *streamState
 }
 
-// Key returns the key for the topic.
-// The key is a combination of the interval string, the path, and the streaming key.
-// For example, if the path is "my/topic" and the interval is 1s, the key will be "1s/my/topic/streamingkey".
+type streamState struct {
+	mu             sync.Mutex
+	framer         *framer
+	watermark      time.Time // timestamp of the last message emitted to the live stream
+	pahoSubscribed bool      // whether an MQTT subscription is currently open for this topic
+	attachedCount  int       // number of active RunStream consumers
+	detachedAt     time.Time // when attachedCount last dropped to 0 (for janitor cleanup)
+}
+
+// newStreamTopic builds a Topic with buffering/streaming state initialized.
+func newStreamTopic(topicPath string, interval time.Duration, fields []string, window time.Duration) *Topic {
+	if window <= 0 {
+		window = defaultWindow
+	}
+	return &Topic{
+		Path:     topicPath,
+		Interval: interval,
+		Fields:   fields,
+		Window:   window,
+		stream:   &streamState{framer: newFramer(fields...)},
+	}
+}
+
+// ensureStream lazily initializes stream state for Topics created as literals
+// (e.g. in tests). Client-managed topics are always built via newStreamTopic so
+// this is a no-op for them.
+func (t *Topic) ensureStream() {
+	if t.stream == nil {
+		if t.Window <= 0 {
+			t.Window = defaultWindow
+		}
+		t.stream = &streamState{framer: newFramer(t.Fields...)}
+	}
+}
+
+// reconcileFields ensures the topic's framer matches the requested field selection.
+// A topic can be created without fields by the RunStream fallback (which has no access
+// to the query's field list) if a Live subscription races ahead of QueryData; when
+// QueryData later runs with fields, this brings the framer into line. The raw ring
+// buffer is retained and simply re-framed on the next Seed/Stream call.
+func (t *Topic) reconcileFields(fields []string) {
+	t.ensureStream()
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
+	if sameStrings(t.Fields, fields) {
+		return
+	}
+	t.Fields = fields
+	t.stream.framer = newFramer(fields...)
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Key returns the key for the topic: interval, path, and streaming key joined.
+// Field selection is NOT part of the key (it travels in the query JSON); the
+// frontend folds the selected fields into the streaming-key hash so different
+// selections already map to distinct keys.
 func (t *Topic) Key() string {
 	return path.Join(t.Interval.String(), t.Path, t.StreamingKey)
 }
 
-// ToDataFrame converts the topic to a data frame.
-func (t *Topic) ToDataFrame(logger log.Logger) (*data.Frame, error) {
-	if t.framer == nil {
-		t.framer = newFramer()
+// appendMessage adds a message to the ring buffer and trims by window and cap.
+func (t *Topic) appendMessage(m Message) {
+	t.ensureStream()
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
+	t.Messages = append(t.Messages, m)
+	t.trimLocked(m.Timestamp)
+}
+
+func (t *Topic) trimLocked(now time.Time) {
+	if t.Window > 0 {
+		cutoff := now.Add(-t.Window)
+		drop := 0
+		for drop < len(t.Messages) && t.Messages[drop].Timestamp.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			t.Messages = append(t.Messages[:0], t.Messages[drop:]...)
+		}
 	}
-	return t.framer.toFrame(t.Messages, logger)
+	if len(t.Messages) > maxBufferedMessages {
+		t.Messages = append(t.Messages[:0], t.Messages[len(t.Messages)-maxBufferedMessages:]...)
+	}
+}
+
+// SeedFrame frames the entire retained buffer, for QueryData to seed a panel with
+// recent history (seed-then-stream). It advances the stream watermark to the last
+// seeded message so the subsequent live stream does not re-send seeded rows.
+func (t *Topic) SeedFrame(logger log.Logger) (*data.Frame, error) {
+	t.ensureStream()
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
+
+	msgs := make([]Message, len(t.Messages))
+	copy(msgs, t.Messages)
+	if len(msgs) > 0 {
+		t.stream.watermark = msgs[len(msgs)-1].Timestamp
+	}
+	frame, err := t.stream.framer.toFrame(msgs, logger)
+	t.applyLabels(frame, msgs)
+	return frame, err
+}
+
+// StreamDelta frames only the messages that have arrived since the last emit and
+// advances the watermark. Returns ok=false when there is nothing new to send.
+func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
+	t.ensureStream()
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
+
+	var delta []Message
+	for _, m := range t.Messages {
+		if m.Timestamp.After(t.stream.watermark) {
+			delta = append(delta, m)
+		}
+	}
+	if len(delta) == 0 {
+		return nil, false, nil
+	}
+	t.stream.watermark = delta[len(delta)-1].Timestamp
+	frame, err := t.stream.framer.toFrame(delta, logger)
+	t.applyLabels(frame, delta)
+	return frame, true, err
+}
+
+// applyLabels attaches identifying labels to the selected value fields so multiple
+// queries in one panel are distinguishable and the legend can be templated
+// (e.g. Display name = ${__field.labels.name} or ${__field.labels.topic}). Only
+// applied in selection mode so classic-mode frames (and their golden tests) are
+// untouched. Called with the topic's stream lock held.
+func (t *Topic) applyLabels(frame *data.Frame, msgs []Message) {
+	if frame == nil || len(t.Fields) == 0 {
+		return
+	}
+	labels := data.Labels{}
+	if decoded, err := base64.RawURLEncoding.DecodeString(t.Path); err == nil {
+		labels["topic"] = string(decoded)
+	}
+	// Best-effort: the payload's top-level "name" (constant per topic, e.g.
+	// "show stats client" / "show queue *").
+	if len(msgs) > 0 {
+		var root map[string]interface{}
+		if json.Unmarshal(msgs[len(msgs)-1].Value, &root) == nil {
+			if name, ok := root["name"].(string); ok && name != "" {
+				labels["name"] = name
+			}
+		}
+	}
+	for _, f := range frame.Fields {
+		if f.Name == "Time" {
+			continue
+		}
+		f.Labels = labels
+	}
 }
 
 // TopicMap is a thread-safe map of topics
@@ -56,7 +223,7 @@ func (tm *TopicMap) Load(key string) (*Topic, bool) {
 	return topic, ok
 }
 
-// AddMessage adds a message to the topic for the given path.
+// AddMessage adds a message to every topic whose MQTT path matches.
 func (tm *TopicMap) AddMessage(path string, message Message) {
 	tm.Range(func(key, t any) bool {
 		topic, ok := t.(*Topic)
@@ -64,8 +231,7 @@ func (tm *TopicMap) AddMessage(path string, message Message) {
 			return false
 		}
 		if topic.Path == path {
-			topic.Messages = append(topic.Messages, message)
-			tm.Store(topic)
+			topic.appendMessage(message)
 		}
 		return true
 	})

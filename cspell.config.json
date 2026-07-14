@@ -43,6 +43,9 @@
     "tcps",
     "mqtts",
     "mosquitto",
-    "jsonencode"
+    "jsonencode",
+    "statspump",
+    "semp",
+    "aedes"
   ]
 }

@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -11,6 +12,10 @@ import (
 )
 
 type framer struct {
+	// selected leaf paths (dot notation, e.g. "stats.totalTimeMs"). When empty the
+	// framer falls back to the classic behavior of extracting every top-level key.
+	selected []string
+
 	path     []string
 	iterator *jsoniter.Iterator
 	fields   []*data.Field
@@ -85,14 +90,25 @@ func (df *framer) addValue(fieldType data.FieldType, v interface{}) {
 	df.fieldMap[df.key()] = len(df.fields) - 1
 }
 
-func newFramer() *framer {
+func newFramer(selected ...string) *framer {
 	df := &framer{
 		fieldMap: make(map[string]int),
+		selected: selected,
 	}
 	timeField := data.NewFieldFromFieldType(data.FieldTypeTime, 0)
 	timeField.Name = "Time"
 	df.fields = append(df.fields, timeField)
 	df.fieldMap["Time"] = 0
+
+	// In selection mode pre-create one column per selected path so the frame schema
+	// is deterministic (present even when a message omits the field). This keeps the
+	// seed frame and the streamed frames schema-compatible so Grafana can append.
+	for _, p := range selected {
+		field := data.NewFieldFromFieldType(data.FieldTypeNullableFloat64, 0)
+		field.Name = p
+		df.fields = append(df.fields, field)
+		df.fieldMap[p] = len(df.fields) - 1
+	}
 	return df
 }
 
@@ -105,6 +121,13 @@ func (df *framer) toFrame(messages []Message, logger log.Logger) (*data.Frame, e
 	}
 
 	for _, message := range messages {
+		if len(df.selected) > 0 {
+			df.appendSelected(message.Value, logger)
+			df.fields[0].Append(message.Timestamp)
+			df.extendFields(df.fields[0].Len() - 1)
+			continue
+		}
+
 		df.iterator = jsoniter.ParseBytes(jsoniter.ConfigDefault, message.Value)
 		err := df.next(logger)
 		if err != nil {
@@ -120,10 +143,89 @@ func (df *framer) toFrame(messages []Message, logger log.Logger) (*data.Frame, e
 	return data.NewFrame("mqtt", df.fields...), nil
 }
 
+// appendSelected extracts each configured leaf path from a single JSON message and
+// appends its value to the matching pre-created column. Missing paths get a nil.
+func (df *framer) appendSelected(payload []byte, logger log.Logger) {
+	var root interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		logger.Debug("selection: JSON parse failed", "error", err, "value", string(payload))
+		root = nil
+	}
+	for _, p := range df.selected {
+		idx := df.fieldMap[p]
+		leaf, ok := lookupPath(root, p)
+		if !ok || leaf == nil {
+			df.fields[idx].Append(nil)
+			continue
+		}
+		df.appendTyped(idx, leaf)
+	}
+}
+
+// appendTyped appends a decoded JSON leaf to the column at idx. Columns are created
+// as nullable float64; a leaf whose type does not match the column is appended as nil
+// rather than dropped or panicking (mixed-type metric streams are unusual).
+func (df *framer) appendTyped(idx int, leaf interface{}) {
+	f := df.fields[idx]
+	if v, ok := leaf.(float64); ok && f.Type() == data.FieldTypeNullableFloat64 {
+		val := v
+		f.Append(&val)
+		return
+	}
+	f.Append(nil)
+}
+
 func (df *framer) extendFields(idx int) {
 	for _, f := range df.fields {
 		if idx+1 > f.Len() {
 			f.Extend(idx + 1 - f.Len())
 		}
 	}
+}
+
+// lookupPath walks a dot-separated path into a decoded JSON value and returns the
+// leaf. Only object traversal is supported (arrays are treated as leaves/JSON).
+func lookupPath(root interface{}, dotted string) (interface{}, bool) {
+	cur := root
+	for _, seg := range strings.Split(dotted, ".") {
+		obj, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur, ok = obj[seg]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// FlattenLeafPaths returns every scalar leaf path (dot notation) found in a JSON
+// sample message, sorted. Used by discovery to offer a field pick-list. Objects are
+// descended into; arrays and scalars are treated as leaves.
+func FlattenLeafPaths(payload []byte) ([]string, error) {
+	var root interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil, err
+	}
+	var out []string
+	var walk func(prefix string, v interface{})
+	walk = func(prefix string, v interface{}) {
+		if obj, ok := v.(map[string]interface{}); ok && len(obj) > 0 {
+			for k, child := range obj {
+				next := k
+				if prefix != "" {
+					next = prefix + "." + k
+				}
+				walk(next, child)
+			}
+			return
+		}
+		if prefix != "" {
+			out = append(out, prefix)
+		}
+	}
+	walk("", root)
+	sort.Strings(out)
+	return out, nil
 }

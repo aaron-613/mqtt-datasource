@@ -5,8 +5,11 @@ import { config } from '@grafana/runtime';
  * be unique for each distinct query execution plan.  This key is not secure and is only picked to avoid
  * possible collisions
  */
-export async function getLiveStreamKey(datasourceUid: string, topic?: string): Promise<string> {
-  const str = JSON.stringify({ topic });
+export async function getLiveStreamKey(datasourceUid: string, topic?: string, fields?: string[]): Promise<string> {
+  // Folding the selected fields into the hash means different field selections map to
+  // distinct channels. When fields is undefined JSON.stringify omits it, so classic
+  // queries hash identically to before (backwards compatible).
+  const str = JSON.stringify({ topic, fields });
 
   const orgId = config.bootData.user.orgId;
   const msgUint8 = new TextEncoder().encode(str); // encode as (utf-8) Uint8Array
