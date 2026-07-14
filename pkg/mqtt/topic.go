@@ -27,10 +27,11 @@ type Message struct {
 
 // Topic represents a MQTT topic subscription.
 type Topic struct {
-	Path         string        `json:"topic"`
-	StreamingKey string        `json:"streamingKey,omitempty"`
-	Fields       []string      `json:"fields,omitempty"` // selected leaf paths (dot notation); empty = classic top-level extraction
-	Interval     time.Duration `json:"-"`
+	Path         string            `json:"topic"`
+	StreamingKey string            `json:"streamingKey,omitempty"`
+	Fields       []string          `json:"fields,omitempty"`       // selected leaf paths (dot notation); empty = classic top-level extraction
+	FieldAliases map[string]string `json:"fieldAliases,omitempty"` // leaf path -> display-name alias for the legend
+	Interval     time.Duration     `json:"-"`
 	Window       time.Duration `json:"-"` // ring buffer retention window
 	Messages     []Message     `json:"-"` // retained ring buffer (also the source for streamed deltas)
 
@@ -80,10 +81,11 @@ func (t *Topic) ensureStream() {
 // to the query's field list) if a Live subscription races ahead of QueryData; when
 // QueryData later runs with fields, this brings the framer into line. The raw ring
 // buffer is retained and simply re-framed on the next Seed/Stream call.
-func (t *Topic) reconcileFields(fields []string) {
+func (t *Topic) reconcileFields(fields []string, aliases map[string]string) {
 	t.ensureStream()
 	t.stream.mu.Lock()
 	defer t.stream.mu.Unlock()
+	t.FieldAliases = aliases // aliases only affect display name (applied in applyLabels), no framer rebuild
 	if sameStrings(t.Fields, fields) {
 		return
 	}
@@ -204,6 +206,12 @@ func (t *Topic) applyLabels(frame *data.Frame, msgs []Message) {
 			continue
 		}
 		f.Labels = labels
+		if alias, ok := t.FieldAliases[f.Name]; ok && alias != "" {
+			if f.Config == nil {
+				f.Config = &data.FieldConfig{}
+			}
+			f.Config.DisplayNameFromDS = alias
+		}
 	}
 }
 

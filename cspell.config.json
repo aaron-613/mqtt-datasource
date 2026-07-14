@@ -46,6 +46,7 @@
     "jsonencode",
     "statspump",
     "semp",
-    "aedes"
+    "aedes",
+    "httpadapter"
   ]
 }

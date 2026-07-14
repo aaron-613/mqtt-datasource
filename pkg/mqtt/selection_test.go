@@ -48,6 +48,17 @@ func TestSelection_AppliesTopicAndNameLabels(t *testing.T) {
 	require.Equal(t, "show stats client", frame.Fields[1].Labels["name"])
 }
 
+func TestSelection_AppliesFieldAlias(t *testing.T) {
+	topic := newStreamTopic(base64.RawURLEncoding.EncodeToString([]byte("t")), time.Second, []string{"stats.total-time-ms"}, time.Hour)
+	topic.FieldAliases = map[string]string{"stats.total-time-ms": "Poll time"}
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"total-time-ms":2.5}}`)})
+
+	frame, err := topic.SeedFrame(log.DefaultLogger)
+	require.NoError(t, err)
+	require.NotNil(t, frame.Fields[1].Config)
+	require.Equal(t, "Poll time", frame.Fields[1].Config.DisplayNameFromDS)
+}
+
 func TestFramer_Selection_MissingPathIsNil(t *testing.T) {
 	f := newFramer("stats.totalTimeMs", "stats.missing")
 	msgs := []Message{{Timestamp: time.Unix(0, 0), Value: []byte(statsPumpMsg)}}

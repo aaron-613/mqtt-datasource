@@ -65,6 +65,30 @@ export const ConfigEditor = (props: DataSourcePluginOptionsEditorProps<MqttDataS
 
       <Divider />
 
+      <ConfigSection title="Discovery">
+        <Field
+          label="Discovery mode"
+          description="Subscribe to a root topic wildcard and offer topic/field pick-lists in the query editor instead of hand-typed topics."
+        >
+          <Switch onChange={onSwitchChanged('discoveryMode')} value={jsonData.discoveryMode || false} />
+        </Field>
+
+        {jsonData.discoveryMode ? (
+          <Field label="Root topic" description='Wildcard subscription used to discover topics, e.g. "mqtt/PUMP/#".'>
+            <Input
+              width={WIDTH_LONG}
+              name="Root topic"
+              type="text"
+              value={jsonData.rootTopic || ''}
+              onChange={onUpdateDatasourceJsonDataOption(props, 'rootTopic')}
+              placeholder="e.g. mqtt/PUMP/#"
+            />
+          </Field>
+        ) : null}
+      </ConfigSection>
+
+      <Divider />
+
       <ConfigSection title="Authentication">
         <Field label="Username">
           <Input

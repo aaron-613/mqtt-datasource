@@ -10,8 +10,11 @@ import { Observable, from, switchMap } from 'rxjs';
 import { getLiveStreamKey } from './streaming';
 
 export class DataSource extends DataSourceWithBackend<MqttQuery, MqttDataSourceOptions> {
+  readonly discoveryMode: boolean;
+
   constructor(instanceSettings: DataSourceInstanceSettings<MqttDataSourceOptions>) {
     super(instanceSettings);
+    this.discoveryMode = !!instanceSettings.jsonData?.discoveryMode;
   }
 
   query(request: DataQueryRequest<MqttQuery>): Observable<DataQueryResponse> {

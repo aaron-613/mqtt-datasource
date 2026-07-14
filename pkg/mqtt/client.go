@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -20,6 +22,8 @@ type Client interface {
 	IsConnected() bool
 	Subscribe(string, log.Logger) (*Topic, error)
 	Unsubscribe(string, log.Logger) error
+	ListTopics() []string
+	SampleFor(string) ([]byte, bool)
 	Dispose()
 }
 
@@ -32,6 +36,11 @@ type Options struct {
 	TLSClientCert string `json:"tlsClientCert"`
 	TLSClientKey  string `json:"tlsClientKey"`
 	TLSSkipVerify bool   `json:"tlsSkipVerify"`
+	// Discovery: when enabled, the client subscribes to RootTopic (a wildcard) and
+	// records the most recent sample payload per concrete topic, for the topic/field
+	// pick-lists. This is independent of graphing subscriptions.
+	DiscoveryMode bool   `json:"discoveryMode"`
+	RootTopic     string `json:"rootTopic"`
 }
 
 // detachGracePeriod is how long a topic's ring buffer (and its MQTT subscription) is
@@ -41,12 +50,24 @@ type Options struct {
 const (
 	detachGracePeriod = 5 * time.Minute
 	janitorInterval   = 60 * time.Second
+	// maxDiscoveredTopics bounds the discovery registry so a broad wildcard can't grow
+	// it without limit.
+	maxDiscoveredTopics = 2000
 )
 
 type client struct {
 	client paho.Client
 	topics TopicMap
 	done   chan struct{}
+
+	// discovered holds the most recent sample payload per concrete topic seen on the
+	// discovery (root wildcard) subscription. Used only for the pick-lists. discOrder
+	// tracks first-seen insertion order for FIFO eviction once the cap is reached, so a
+	// full registry admits newly-appearing topics (dropping the oldest) rather than
+	// dropping the new ones.
+	discMu     sync.RWMutex
+	discovered map[string][]byte
+	discOrder  []string
 }
 
 func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstanceSettings) (Client, error) {
@@ -114,11 +135,62 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	}
 
 	c := &client{
-		client: pahoClient,
-		done:   make(chan struct{}),
+		client:     pahoClient,
+		done:       make(chan struct{}),
+		discovered: make(map[string][]byte),
 	}
 	go c.janitor()
+
+	if o.DiscoveryMode && o.RootTopic != "" {
+		logger.Info("MQTT discovery subscribing", "rootTopic", o.RootTopic)
+		if token := pahoClient.Subscribe(o.RootTopic, 0, func(_ paho.Client, m paho.Message) {
+			c.recordDiscovered(m.Topic(), m.Payload())
+		}); token.Wait() && token.Error() != nil {
+			// Discovery is best-effort; a bad root topic shouldn't fail the datasource.
+			logger.Warn("MQTT discovery subscribe failed", "rootTopic", o.RootTopic, "error", token.Error())
+		}
+	}
 	return c, nil
+}
+
+// recordDiscovered stores the latest sample payload for a concrete topic seen on the
+// discovery subscription, bounded by maxDiscoveredTopics.
+func (c *client) recordDiscovered(topic string, payload []byte) {
+	c.discMu.Lock()
+	defer c.discMu.Unlock()
+	sample := make([]byte, len(payload))
+	copy(sample, payload)
+
+	if _, exists := c.discovered[topic]; !exists {
+		if len(c.discovered) >= maxDiscoveredTopics && len(c.discOrder) > 0 {
+			// Evict the oldest first-seen topic so a newly-appearing one is admitted.
+			oldest := c.discOrder[0]
+			c.discOrder = c.discOrder[1:]
+			delete(c.discovered, oldest)
+		}
+		c.discOrder = append(c.discOrder, topic)
+	}
+	c.discovered[topic] = sample
+}
+
+// ListTopics returns the discovered topics, sorted.
+func (c *client) ListTopics() []string {
+	c.discMu.RLock()
+	defer c.discMu.RUnlock()
+	topics := make([]string, 0, len(c.discovered))
+	for t := range c.discovered {
+		topics = append(topics, t)
+	}
+	sort.Strings(topics)
+	return topics
+}
+
+// SampleFor returns the most recent sample payload for a discovered topic.
+func (c *client) SampleFor(topic string) ([]byte, bool) {
+	c.discMu.RLock()
+	defer c.discMu.RUnlock()
+	sample, ok := c.discovered[topic]
+	return sample, ok
 }
 
 // janitor periodically removes topics whose consumers have all detached for longer
@@ -211,11 +283,12 @@ func (c *client) EnsureTopic(t *Topic) *Topic {
 	if existing, ok := c.topics.Load(t.Key()); ok {
 		// A topic may already exist without the right field selection (e.g. created by
 		// the RunStream fallback on a Live reconnect before QueryData ran). Reconcile it.
-		existing.reconcileFields(t.Fields)
+		existing.reconcileFields(t.Fields, t.FieldAliases)
 		return existing
 	}
 	stored := newStreamTopic(t.Path, t.Interval, t.Fields, t.Window)
 	stored.StreamingKey = t.StreamingKey
+	stored.FieldAliases = t.FieldAliases
 	c.topics.Map.Store(t.Key(), stored)
 	return stored
 }
