@@ -36,12 +36,21 @@ func NewMQTTInstance(ctx context.Context, s backend.DataSourceInstanceSettings) 
 		return nil, err
 	}
 
-	return NewMQTTDatasource(client, s.UID), nil
+	ds := NewMQTTDatasource(client, s.UID)
+	if settings.MaxSeries > 0 {
+		ds.maxSeries = settings.MaxSeries
+	}
+	return ds, nil
 }
+
+// defaultMaxSeries caps how many concrete topics a wildcard query fans out into when
+// the datasource does not configure its own limit.
+const defaultMaxSeries = 100
 
 type MQTTDatasource struct {
 	Client        mqtt.Client
 	channelPrefix string
+	maxSeries     int
 
 	// CallResourceHandler serves the discovery resource endpoints (/topics, /fields)
 	// that the query editor's pick-lists fetch from.
@@ -53,6 +62,7 @@ func NewMQTTDatasource(client mqtt.Client, uid string) *MQTTDatasource {
 	ds := &MQTTDatasource{
 		Client:        client,
 		channelPrefix: path.Join("ds", uid),
+		maxSeries:     defaultMaxSeries,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/topics", ds.handleTopics)
@@ -71,7 +81,7 @@ func (ds *MQTTDatasource) handleTopics(w http.ResponseWriter, _ *http.Request) {
 // (non-base64) topic as the ?topic= query parameter.
 func (ds *MQTTDatasource) handleFields(w http.ResponseWriter, r *http.Request) {
 	topic := r.URL.Query().Get("topic")
-	sample, ok := ds.Client.SampleFor(topic)
+	sample, ok := ds.sampleForTopic(topic)
 	if !ok {
 		writeJSON(w, []string{})
 		return
@@ -82,6 +92,23 @@ func (ds *MQTTDatasource) handleFields(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, paths)
+}
+
+// sampleForTopic returns a representative sample payload for a topic. For a wildcard
+// it uses the first discovered concrete topic that matches (fields are assumed uniform
+// across matches), rather than a union of all payloads.
+func (ds *MQTTDatasource) sampleForTopic(topic string) ([]byte, bool) {
+	if mqtt.IsWildcard(topic) {
+		for _, concrete := range ds.Client.ListTopics() {
+			if _, ok := mqtt.MatchTopic(topic, concrete); ok {
+				if s, ok := ds.Client.SampleFor(concrete); ok {
+					return s, true
+				}
+			}
+		}
+		return nil, false
+	}
+	return ds.Client.SampleFor(topic)
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

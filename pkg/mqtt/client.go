@@ -41,6 +41,8 @@ type Options struct {
 	// pick-lists. This is independent of graphing subscriptions.
 	DiscoveryMode bool   `json:"discoveryMode"`
 	RootTopic     string `json:"rootTopic"`
+	// MaxSeries caps how many concrete topics a wildcard query fans out into (0 = default).
+	MaxSeries int `json:"maxSeries"`
 }
 
 // detachGracePeriod is how long a topic's ring buffer (and its MQTT subscription) is
@@ -141,13 +143,21 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	}
 	go c.janitor()
 
-	if o.DiscoveryMode && o.RootTopic != "" {
-		logger.Info("MQTT discovery subscribing", "rootTopic", o.RootTopic)
-		if token := pahoClient.Subscribe(o.RootTopic, 0, func(_ paho.Client, m paho.Message) {
+	if o.DiscoveryMode {
+		// RootTopic may list several wildcard filters, comma-separated.
+		handler := func(_ paho.Client, m paho.Message) {
 			c.recordDiscovered(m.Topic(), m.Payload())
-		}); token.Wait() && token.Error() != nil {
-			// Discovery is best-effort; a bad root topic shouldn't fail the datasource.
-			logger.Warn("MQTT discovery subscribe failed", "rootTopic", o.RootTopic, "error", token.Error())
+		}
+		for _, rt := range strings.Split(o.RootTopic, ",") {
+			rt = strings.TrimSpace(rt)
+			if rt == "" {
+				continue
+			}
+			logger.Info("MQTT discovery subscribing", "rootTopic", rt)
+			if token := pahoClient.Subscribe(rt, 0, handler); token.Wait() && token.Error() != nil {
+				// Discovery is best-effort; a bad root topic shouldn't fail the datasource.
+				logger.Warn("MQTT discovery subscribe failed", "rootTopic", rt, "error", token.Error())
+			}
 		}
 	}
 	return c, nil
@@ -283,14 +293,42 @@ func (c *client) EnsureTopic(t *Topic) *Topic {
 	if existing, ok := c.topics.Load(t.Key()); ok {
 		// A topic may already exist without the right field selection (e.g. created by
 		// the RunStream fallback on a Live reconnect before QueryData ran). Reconcile it.
-		existing.reconcileFields(t.Fields, t.FieldAliases)
+		existing.reconcileFields(t.Fields, t.FieldAliases, t.SeriesName, t.LabelSource, t.LabelValue)
 		return existing
 	}
 	stored := newStreamTopic(t.Path, t.Interval, t.Fields, t.Window)
 	stored.StreamingKey = t.StreamingKey
 	stored.FieldAliases = t.FieldAliases
+	stored.SeriesName = t.SeriesName
+	stored.LabelSource = t.LabelSource
+	stored.LabelValue = t.LabelValue
+	// Seed the raw buffer from an existing sibling on the same MQTT topic so a new field
+	// selection (its streaming key changes when fields change) opens with recent history
+	// instead of blanking and restarting.
+	if seed := c.siblingBuffer(t.Path); len(seed) > 0 {
+		stored.Messages = seed
+	}
 	c.topics.Map.Store(t.Key(), stored)
 	return stored
+}
+
+// siblingBuffer returns a copy of the largest ring buffer among already-registered
+// topics sharing the same MQTT path (base64), used to seed a newly-created topic.
+func (c *client) siblingBuffer(path string) []Message {
+	var best []Message
+	c.topics.Range(func(_, v any) bool {
+		topic, ok := v.(*Topic)
+		if !ok || topic.Path != path || topic.stream == nil {
+			return true
+		}
+		topic.stream.mu.Lock()
+		if len(topic.Messages) > len(best) {
+			best = append([]Message(nil), topic.Messages...)
+		}
+		topic.stream.mu.Unlock()
+		return true
+	})
+	return best
 }
 
 func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {

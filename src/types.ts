@@ -10,6 +10,13 @@ export interface MqttQuery extends DataQuery {
   fields?: string[];
   // Optional per-field display-name alias for the legend, keyed by leaf path.
   fieldAliases?: Record<string, string>;
+  // For a wildcard topic: only graph matching concrete topics whose name contains this substring.
+  filter?: string;
+  // Series (object) label — which dimension names each series in the legend.
+  labelSource?: 'topic' | 'payload' | 'custom';
+  // Meaning depends on labelSource: topic level indices (e.g. "5" or "3,5"; blank = wildcard match),
+  // a payload field path, or a literal string.
+  labelValue?: string;
 }
 
 export interface MqttDataSourceOptions extends DataSourceJsonData {
@@ -23,6 +30,8 @@ export interface MqttDataSourceOptions extends DataSourceJsonData {
   // pick-lists in the query editor instead of hand-typed topics.
   discoveryMode?: boolean;
   rootTopic?: string;
+  // Cap on how many concrete topics a wildcard query fans out into (default 100).
+  maxSeries?: number;
 }
 
 export interface MqttSecureJsonData {

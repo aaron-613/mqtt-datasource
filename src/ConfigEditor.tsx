@@ -74,16 +74,34 @@ export const ConfigEditor = (props: DataSourcePluginOptionsEditorProps<MqttDataS
         </Field>
 
         {jsonData.discoveryMode ? (
-          <Field label="Root topic" description='Wildcard subscription used to discover topics, e.g. "mqtt/PUMP/#".'>
-            <Input
-              width={WIDTH_LONG}
-              name="Root topic"
-              type="text"
-              value={jsonData.rootTopic || ''}
-              onChange={onUpdateDatasourceJsonDataOption(props, 'rootTopic')}
-              placeholder="e.g. mqtt/PUMP/#"
-            />
-          </Field>
+          <>
+            <Field
+              label="Root topic(s)"
+              description='Wildcard subscription(s) used to discover topics — comma-separate for multiple, e.g. "mqtt/PUMP/#, sensors/#".'
+            >
+              <Input
+                width={WIDTH_LONG}
+                name="Root topic"
+                type="text"
+                value={jsonData.rootTopic || ''}
+                onChange={onUpdateDatasourceJsonDataOption(props, 'rootTopic')}
+                placeholder="e.g. mqtt/PUMP/#, sensors/#"
+              />
+            </Field>
+            <Field label="Max series" description="Max concrete topics a wildcard query graphs (default 100).">
+              <Input
+                width={WIDTH_LONG}
+                name="Max series"
+                type="number"
+                value={jsonData.maxSeries?.toString() ?? ''}
+                onChange={(e) => {
+                  const n = parseInt(e.currentTarget.value, 10);
+                  updateDatasourcePluginJsonDataOption(props, 'maxSeries', isNaN(n) ? undefined : n);
+                }}
+                placeholder="100"
+              />
+            </Field>
+          </>
         ) : null}
       </ConfigSection>
 

@@ -1,12 +1,12 @@
 import React from 'react';
-import { Input, InlineFieldRow, InlineField, TextArea, Combobox, MultiCombobox, ComboboxOption } from '@grafana/ui';
+import { Input, InlineFieldRow, InlineField, TextArea, Combobox, ComboboxOption, IconButton } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { MqttDataSourceOptions, MqttQuery } from './types';
 
 type Props = QueryEditorProps<DataSource, MqttQuery, MqttDataSourceOptions>;
 
-const LABEL_WIDTH = 10;
+const LABEL_WIDTH = 14;
 
 // Parse the multi-line/comma-separated Fields input into a clean list of leaf paths.
 const parseFields = (raw: string): string[] =>
@@ -16,6 +16,12 @@ const parseFields = (raw: string): string[] =>
     .filter((s) => s.length > 0);
 
 const toOptions = (values: string[]): Array<ComboboxOption<string>> => values.map((v) => ({ label: v, value: v }));
+
+const LABEL_SOURCES: Array<ComboboxOption<string>> = [
+  { label: 'Topic level', value: 'topic' },
+  { label: 'Payload field', value: 'payload' },
+  { label: 'Custom', value: 'custom' },
+];
 
 const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => (
   <>
@@ -54,6 +60,9 @@ const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => (
 );
 
 const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => {
+  const fields = query.fields ?? [];
+  const isWildcard = /[+#]/.test(query.topic ?? '');
+
   const loadTopics = async (input: string): Promise<Array<ComboboxOption<string>>> => {
     const topics = await datasource.getResource<string[]>('topics');
     const needle = input.toLowerCase();
@@ -64,27 +73,79 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
     if (!query.topic) {
       return [];
     }
-    const fields = await datasource.getResource<string[]>('fields', { topic: query.topic });
+    let all: string[] = [];
+    try {
+      all = await datasource.getResource<string[]>('fields', { topic: query.topic });
+    } catch {
+      all = [];
+    }
+    // Always include already-selected fields so they render even while discovery is warming
+    // (or if the topic isn't in the registry yet) — otherwise the picker looks blanked.
+    const merged = Array.from(new Set([...(query.fields ?? []), ...all]));
     const needle = input.toLowerCase();
-    return toOptions(fields.filter((f) => f.toLowerCase().includes(needle)));
+    return toOptions(merged.filter((f) => f.toLowerCase().includes(needle)));
   };
 
-  const onTopicChange = (option: ComboboxOption<string> | null) => {
-    // Changing topic invalidates the previously-selected fields/aliases.
-    onChange({ ...query, topic: option?.value, fields: [], fieldAliases: {} });
+  // Picking a discovered topic replaces the topic but keeps the field selection — a field
+  // still present in the new topic keeps working; a stale one can be changed/removed.
+  const onTopicPicked = (option: ComboboxOption<string> | null) => {
+    if (!option?.value) {
+      return;
+    }
+    onChange({ ...query, topic: option.value });
     onRunQuery();
   };
 
-  const onFieldsChange = (options: Array<ComboboxOption<string>>) => {
-    const fields = options.map((o) => o.value);
-    // Drop aliases for fields that are no longer selected.
-    const aliases: Record<string, string> = {};
-    for (const f of fields) {
-      if (query.fieldAliases?.[f]) {
-        aliases[f] = query.fieldAliases[f];
-      }
+  const onFilterChange = (value: string) => {
+    onChange({ ...query, filter: value.trim() || undefined });
+    onRunQuery();
+  };
+
+  const labelSource = query.labelSource ?? 'topic';
+  const onLabelSourceChange = (option: ComboboxOption<string> | null) => {
+    onChange({ ...query, labelSource: (option?.value as MqttQuery['labelSource']) ?? 'topic', labelValue: undefined });
+    onRunQuery();
+  };
+  const onLabelValueChange = (value: string) => {
+    onChange({ ...query, labelValue: value.trim() || undefined });
+    onRunQuery();
+  };
+  const labelValuePlaceholder =
+    labelSource === 'topic'
+      ? 'e.g. 3 or 3,5 or -2 (blank == wildcard match, or last level)'
+      : labelSource === 'payload'
+        ? 'e.g. name or userId or system'
+        : 'text';
+
+  const setFieldAt = (index: number, field?: string) => {
+    if (!field) {
+      return;
     }
-    onChange({ ...query, fields, fieldAliases: aliases });
+    const next = [...fields];
+    const prev = next[index];
+    next[index] = field;
+    const aliases = { ...(query.fieldAliases ?? {}) };
+    if (prev && prev !== field && aliases[prev]) {
+      aliases[field] = aliases[prev];
+      delete aliases[prev];
+    }
+    onChange({ ...query, fields: next, fieldAliases: aliases });
+    onRunQuery();
+  };
+
+  const removeFieldAt = (index: number) => {
+    const removed = fields[index];
+    const aliases = { ...(query.fieldAliases ?? {}) };
+    delete aliases[removed];
+    onChange({ ...query, fields: fields.filter((_, i) => i !== index), fieldAliases: aliases });
+    onRunQuery();
+  };
+
+  const addField = (field?: string) => {
+    if (!field || fields.includes(field)) {
+      return;
+    }
+    onChange({ ...query, fields: [...fields, field] });
     onRunQuery();
   };
 
@@ -103,45 +164,98 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
   return (
     <>
       <InlineFieldRow>
-        <InlineField label="Topic" labelWidth={LABEL_WIDTH} grow tooltip="Pick a discovered topic from the broker.">
+        <InlineField
+          label="Topic"
+          labelWidth={LABEL_WIDTH}
+          grow
+          tooltip="Type a concrete topic or a wildcard pattern (+ / #). Use Browse to pick a discovered topic."
+        >
+          <Input
+            value={query.topic ?? ''}
+            placeholder="topic or wildcard, e.g. mqtt/PUMP/+/POLLER_STAT/VPN/queue_rates"
+            onChange={(e) => onChange({ ...query, topic: e.currentTarget.value })}
+            onBlur={onRunQuery}
+          />
+        </InlineField>
+        {isWildcard && (
+          <InlineField label="Filter" labelWidth={8} tooltip="Only graph matching topics whose name contains this text.">
+            <Input
+              placeholder="substring"
+              defaultValue={query.filter ?? ''}
+              onBlur={(e) => onFilterChange(e.currentTarget.value)}
+              width={22}
+            />
+          </InlineField>
+        )}
+      </InlineFieldRow>
+
+      <InlineFieldRow>
+        <InlineField
+          label="Browse"
+          labelWidth={LABEL_WIDTH}
+          tooltip="Pick a discovered topic to fill the Topic field. Start typing to filter the list."
+        >
           <Combobox
             options={loadTopics}
-            value={query.topic ?? null}
-            onChange={onTopicChange}
-            placeholder="Select a topic"
-            isClearable
-            width="auto"
-            minWidth={40}
+            value={null}
+            onChange={onTopicPicked}
+            placeholder="type to filter discovered topics…"
+            width={50}
           />
         </InlineField>
       </InlineFieldRow>
+
+      {fields.map((f, i) => (
+        <InlineFieldRow key={`${f}-${i}`}>
+          <InlineField label={i === 0 ? 'Fields' : ' '} labelWidth={LABEL_WIDTH}>
+            <Combobox options={loadFields} value={f} onChange={(o) => setFieldAt(i, o?.value)} createCustomValue width={40} />
+          </InlineField>
+          <InlineField label="Alias" labelWidth={7} tooltip="Optional legend name for this field.">
+            <Input
+              placeholder="(optional)"
+              defaultValue={query.fieldAliases?.[f] ?? ''}
+              onBlur={(e) => onAliasChange(f, e.currentTarget.value)}
+              width={24}
+            />
+          </InlineField>
+          <IconButton name="trash-alt" tooltip="Remove field" onClick={() => removeFieldAt(i)} />
+        </InlineFieldRow>
+      ))}
+
       <InlineFieldRow>
-        <InlineField
-          label="Fields"
-          labelWidth={LABEL_WIDTH}
-          grow
-          tooltip="Pick which JSON leaf fields to graph (discovered from a sample message)."
-        >
-          <MultiCombobox
+        <InlineField label={fields.length === 0 ? 'Fields' : ' '} labelWidth={LABEL_WIDTH}>
+          <Combobox
             options={loadFields}
-            value={query.fields ?? []}
-            onChange={onFieldsChange}
-            placeholder={query.topic ? 'Select fields' : 'Select a topic first'}
+            value={null}
+            onChange={(o) => addField(o?.value)}
+            placeholder={query.topic ? '+ add field' : 'set a topic first'}
             width={40}
           />
         </InlineField>
       </InlineFieldRow>
-      {(query.fields ?? []).map((path) => (
-        <InlineFieldRow key={path}>
-          <InlineField label={path} labelWidth={28} grow tooltip="Optional legend alias for this field.">
-            <Input
-              placeholder="alias (optional)"
-              defaultValue={query.fieldAliases?.[path] ?? ''}
-              onBlur={(e) => onAliasChange(path, e.currentTarget.value)}
-            />
-          </InlineField>
-        </InlineFieldRow>
-      ))}
+
+      <InlineFieldRow>
+        <InlineField
+          label="Series label"
+          labelWidth={LABEL_WIDTH}
+          tooltip="What names each series (the object dimension). Per-field Alias handles the metric dimension; the legend combines them."
+        >
+          <Combobox options={LABEL_SOURCES} value={labelSource} onChange={onLabelSourceChange} width={18} />
+        </InlineField>
+        <InlineField
+          label=""
+          labelWidth={1}
+          grow
+          tooltip="Topic: level indices (0-based; negatives from the end); blank = the wildcard-matched level(s). Payload: a field path. Custom: a literal string."
+        >
+          <Input
+            key={labelSource}
+            placeholder={labelValuePlaceholder}
+            defaultValue={query.labelValue ?? ''}
+            onBlur={(e) => onLabelValueChange(e.currentTarget.value)}
+          />
+        </InlineField>
+      </InlineFieldRow>
     </>
   );
 };

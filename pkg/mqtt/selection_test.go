@@ -35,28 +35,84 @@ func TestFramer_Selection_NestedPaths(t *testing.T) {
 	require.Equal(t, 12.5, *got)
 }
 
-func TestSelection_AppliesTopicAndNameLabels(t *testing.T) {
-	realTopic := "mqtt/PUMP/solace1025/POLLER_STAT/SYSTEM/stats_client"
-	topic := newStreamTopic(base64.RawURLEncoding.EncodeToString([]byte(realTopic)), time.Second, []string{"stats.total-time-ms"}, time.Hour)
-	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"hostname":"solace1025","name":"show stats client","stats":{"total-time-ms":2.5}}`)})
-
-	frame, err := topic.SeedFrame(log.DefaultLogger)
-	require.NoError(t, err)
-	require.Equal(t, 2, len(frame.Fields))
-	require.Empty(t, frame.Fields[0].Labels, "Time field should have no labels")
-	require.Equal(t, realTopic, frame.Fields[1].Labels["topic"])
-	require.Equal(t, "show stats client", frame.Fields[1].Labels["name"])
+func mkTopic(topicStr string, fields ...string) *Topic {
+	return newStreamTopic(base64.RawURLEncoding.EncodeToString([]byte(topicStr)), time.Second, fields, time.Hour)
 }
 
-func TestSelection_AppliesFieldAlias(t *testing.T) {
-	topic := newStreamTopic(base64.RawURLEncoding.EncodeToString([]byte("t")), time.Second, []string{"stats.total-time-ms"}, time.Hour)
-	topic.FieldAliases = map[string]string{"stats.total-time-ms": "Poll time"}
+func TestSelection_ConcreteDefaultsToLastLevel(t *testing.T) {
+	realTopic := "mqtt/PUMP/solace1025/POLLER_STAT/SYSTEM/stats_client"
+	topic := mkTopic(realTopic, "stats.total-time-ms") // no label config -> default topic/blank
 	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"total-time-ms":2.5}}`)})
 
 	frame, err := topic.SeedFrame(log.DefaultLogger)
 	require.NoError(t, err)
-	require.NotNil(t, frame.Fields[1].Config)
-	require.Equal(t, "Poll time", frame.Fields[1].Config.DisplayNameFromDS)
+	require.Empty(t, frame.Fields[0].Labels, "Time field should have no labels")
+	require.Equal(t, realTopic, frame.Fields[1].Labels["topic"])
+	// Opinionated default: blank topic level on a concrete topic = its last level.
+	require.Equal(t, "stats_client", frame.Fields[1].Labels["series"])
+	require.Equal(t, "stats_client", frame.Fields[1].Config.DisplayNameFromDS)
+}
+
+func TestSelection_AliasIsTheMetricInComposition(t *testing.T) {
+	// A per-field alias renames the metric; it appears in the "object · metric" composition.
+	topic := mkTopic("a/vpn3/c", "stats.a", "stats.b")
+	topic.SeriesName = "vpn3" // as if wildcard-matched
+	topic.FieldAliases = map[string]string{"stats.a": "Latency"}
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"a":1,"b":2}}`)})
+
+	frame, err := topic.SeedFrame(log.DefaultLogger)
+	require.NoError(t, err)
+	require.Equal(t, "vpn3 · Latency", frame.Fields[1].Config.DisplayNameFromDS)
+	require.Equal(t, "vpn3 · b", frame.Fields[2].Config.DisplayNameFromDS)
+}
+
+func TestSelection_PayloadLabelSource(t *testing.T) {
+	topic := mkTopic("t", "stats.v")
+	topic.LabelSource = "payload"
+	topic.LabelValue = "vpn-name"
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"vpn-name":"prod-vpn","stats":{"v":1.5}}`)})
+
+	frame, err := topic.SeedFrame(log.DefaultLogger)
+	require.NoError(t, err)
+	vf := frame.Fields[1]
+	require.Equal(t, "prod-vpn", vf.Labels["series"])
+	require.Equal(t, "prod-vpn", vf.Config.DisplayNameFromDS)
+}
+
+func TestSelection_TopicLevelLabel(t *testing.T) {
+	topic := mkTopic("mqtt/PUMP/solace1025/POLLER_STAT/VPN/vpn3/queue_rates", "stats.v")
+	topic.LabelSource = "topic"
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"v":1}}`)})
+
+	topic.LabelValue = "5" // vpn3
+	frame, _ := topic.SeedFrame(log.DefaultLogger)
+	require.Equal(t, "vpn3", frame.Fields[1].Config.DisplayNameFromDS)
+	require.Equal(t, "vpn3", frame.Fields[1].Labels["series"])
+
+	topic.LabelValue = "2,-1" // solace1025 + queue_rates (negative index = from end)
+	frame, _ = topic.SeedFrame(log.DefaultLogger)
+	require.Equal(t, "solace1025_queue_rates", frame.Fields[1].Config.DisplayNameFromDS)
+}
+
+func TestSelection_CustomLabel(t *testing.T) {
+	topic := mkTopic("a/b", "stats.v")
+	topic.LabelSource = "custom"
+	topic.LabelValue = "MyLabel"
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"v":1}}`)})
+
+	frame, _ := topic.SeedFrame(log.DefaultLogger)
+	require.Equal(t, "MyLabel", frame.Fields[1].Config.DisplayNameFromDS)
+}
+
+func TestSelection_MultiFieldComposition(t *testing.T) {
+	// Wildcard-matched object + two metrics -> "object · metric" per series.
+	topic := mkTopic("a/vpn3/c", "stats.a", "stats.b")
+	topic.SeriesName = "vpn3" // as if set by the wildcard expansion
+	topic.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"a":1,"b":2}}`)})
+
+	frame, _ := topic.SeedFrame(log.DefaultLogger)
+	require.Equal(t, "vpn3 · a", frame.Fields[1].Config.DisplayNameFromDS)
+	require.Equal(t, "vpn3 · b", frame.Fields[2].Config.DisplayNameFromDS)
 }
 
 func TestFramer_Selection_MissingPathIsNil(t *testing.T) {
@@ -127,6 +183,20 @@ func TestTopicMap_AddMessage_FansOutToSameTopic(t *testing.T) {
 
 	require.Equal(t, 1, len(sel.Messages), "selection topic should receive the message")
 	require.Equal(t, 1, len(classic.Messages), "classic topic on the same MQTT topic should also receive it")
+}
+
+func TestEnsureTopic_SeedsBufferFromSibling(t *testing.T) {
+	c := &client{discovered: make(map[string][]byte)}
+	a := newStreamTopic("dGVzdA", time.Second, []string{"x"}, time.Hour)
+	a.StreamingKey = "uid/aaa/1"
+	a.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"x":1}`)})
+	a.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"x":2}`)})
+	c.topics.Store(a)
+
+	// Adding a 2nd field changes the streaming key -> a new topic on the same MQTT path.
+	b := c.EnsureTopic(&Topic{Path: "dGVzdA", StreamingKey: "uid/bbb/1", Interval: time.Second, Fields: []string{"x", "y"}})
+	require.NotSame(t, a, b, "distinct topic instances")
+	require.Equal(t, 2, len(b.Messages), "new field selection seeds its buffer from the sibling's history")
 }
 
 func TestEnsureTopic_ReconcilesFields(t *testing.T) {

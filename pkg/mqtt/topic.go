@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,10 @@ type Topic struct {
 	StreamingKey string            `json:"streamingKey,omitempty"`
 	Fields       []string          `json:"fields,omitempty"`       // selected leaf paths (dot notation); empty = classic top-level extraction
 	FieldAliases map[string]string `json:"fieldAliases,omitempty"` // leaf path -> display-name alias for the legend
+	Filter       string            `json:"filter,omitempty"`       // wildcard substring filter (query-time only)
+	LabelSource  string            `json:"labelSource,omitempty"`  // series-label source: "topic" (default) | "payload" | "custom"
+	LabelValue   string            `json:"labelValue,omitempty"`   // meaning depends on LabelSource: level indices / payload path / literal
+	SeriesName   string            `json:"-"`                      // wildcard-matched segment(s); the topic-source default when LabelValue is empty
 	Interval     time.Duration     `json:"-"`
 	Window       time.Duration `json:"-"` // ring buffer retention window
 	Messages     []Message     `json:"-"` // retained ring buffer (also the source for streamed deltas)
@@ -81,11 +86,15 @@ func (t *Topic) ensureStream() {
 // to the query's field list) if a Live subscription races ahead of QueryData; when
 // QueryData later runs with fields, this brings the framer into line. The raw ring
 // buffer is retained and simply re-framed on the next Seed/Stream call.
-func (t *Topic) reconcileFields(fields []string, aliases map[string]string) {
+func (t *Topic) reconcileFields(fields []string, aliases map[string]string, seriesName, labelSource, labelValue string) {
 	t.ensureStream()
 	t.stream.mu.Lock()
 	defer t.stream.mu.Unlock()
-	t.FieldAliases = aliases // aliases only affect display name (applied in applyLabels), no framer rebuild
+	// aliases, series name and label config only affect display (applied in applyLabels), no framer rebuild
+	t.FieldAliases = aliases
+	t.SeriesName = seriesName
+	t.LabelSource = labelSource
+	t.LabelValue = labelValue
 	if sameStrings(t.Fields, fields) {
 		return
 	}
@@ -178,41 +187,139 @@ func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
 	return frame, true, err
 }
 
-// applyLabels attaches identifying labels to the selected value fields so multiple
-// queries in one panel are distinguishable and the legend can be templated
-// (e.g. Display name = ${__field.labels.name} or ${__field.labels.topic}). Only
-// applied in selection mode so classic-mode frames (and their golden tests) are
-// untouched. Called with the topic's stream lock held.
+// applyLabels attaches identifying labels and a composed display name to the selected
+// value fields. It models two dimensions: the OBJECT (which matched thing — the series
+// label, from a configurable source) and the METRIC (which field — the per-field alias).
+// The legend composes them: single field -> object label; many fields -> object · metric;
+// no object label -> metric (alias) or the raw field name. Only applied in selection mode
+// so classic-mode golden tests are untouched. Called with the topic's stream lock held.
 func (t *Topic) applyLabels(frame *data.Frame, msgs []Message) {
 	if frame == nil || len(t.Fields) == 0 {
 		return
 	}
-	labels := data.Labels{}
+	decodedTopic := ""
 	if decoded, err := base64.RawURLEncoding.DecodeString(t.Path); err == nil {
-		labels["topic"] = string(decoded)
+		decodedTopic = string(decoded)
 	}
-	// Best-effort: the payload's top-level "name" (constant per topic, e.g.
-	// "show stats client" / "show queue *").
-	if len(msgs) > 0 {
-		var root map[string]interface{}
-		if json.Unmarshal(msgs[len(msgs)-1].Value, &root) == nil {
-			if name, ok := root["name"].(string); ok && name != "" {
-				labels["name"] = name
-			}
-		}
+
+	labels := data.Labels{}
+	if decodedTopic != "" {
+		labels["topic"] = decodedTopic
 	}
+	objectLabel := t.objectLabel(decodedTopic, msgs)
+	if objectLabel != "" {
+		labels["series"] = objectLabel
+	}
+
+	multiField := len(t.Fields) > 1
 	for _, f := range frame.Fields {
 		if f.Name == "Time" {
 			continue
 		}
 		f.Labels = labels
-		if alias, ok := t.FieldAliases[f.Name]; ok && alias != "" {
+
+		var display string
+		switch {
+		case objectLabel == "":
+			// No object dimension: fall back to the metric alias, else the field name.
+			display = t.FieldAliases[f.Name]
+		case multiField:
+			metric := t.FieldAliases[f.Name]
+			if metric == "" {
+				metric = lastSegment(f.Name)
+			}
+			display = objectLabel + " · " + metric
+		default:
+			display = objectLabel
+		}
+		if display != "" {
 			if f.Config == nil {
 				f.Config = &data.FieldConfig{}
 			}
-			f.Config.DisplayNameFromDS = alias
+			f.Config.DisplayNameFromDS = display
 		}
 	}
+}
+
+// objectLabel computes the series (object) label from the configured source.
+func (t *Topic) objectLabel(decodedTopic string, msgs []Message) string {
+	switch t.LabelSource {
+	case "custom":
+		return t.LabelValue
+	case "payload":
+		field := t.LabelValue
+		if field == "" {
+			field = "name"
+		}
+		if len(msgs) > 0 {
+			var root interface{}
+			if json.Unmarshal(msgs[len(msgs)-1].Value, &root) == nil {
+				if v, ok := lookupPath(root, field); ok {
+					return stringifyLeaf(v)
+				}
+			}
+		}
+		return ""
+	default: // "topic" (and unset) — the opinionated default
+		if t.LabelValue == "" {
+			// Blank = the wildcard-matched level(s) when there's a wildcard, else the last
+			// level of a concrete topic (equivalent to index -1).
+			if t.SeriesName != "" {
+				return t.SeriesName
+			}
+			segments := strings.Split(decodedTopic, "/")
+			if len(segments) > 0 {
+				return segments[len(segments)-1]
+			}
+			return ""
+		}
+		return joinLevels(strings.Split(decodedTopic, "/"), t.LabelValue)
+	}
+}
+
+// joinLevels picks topic segments by a comma-separated index spec (0-based; negatives
+// count from the end, so -1 = last) and joins them with "_".
+func joinLevels(segments []string, spec string) string {
+	var picked []string
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i, err := strconv.Atoi(part)
+		if err != nil {
+			continue
+		}
+		if i < 0 {
+			i += len(segments)
+		}
+		if i >= 0 && i < len(segments) {
+			picked = append(picked, segments[i])
+		}
+	}
+	return strings.Join(picked, "_")
+}
+
+// stringifyLeaf renders a decoded JSON scalar as a label string.
+func stringifyLeaf(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(x)
+	}
+	return ""
+}
+
+// lastSegment returns the final dot-separated segment of a leaf path
+// (e.g. "stats.total-time-ms" -> "total-time-ms").
+func lastSegment(path string) string {
+	if i := strings.LastIndex(path, "."); i >= 0 {
+		return path[i+1:]
+	}
+	return path
 }
 
 // TopicMap is a thread-safe map of topics
