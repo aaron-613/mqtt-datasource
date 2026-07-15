@@ -20,3 +20,6 @@ services:
   grafana:
     depends_on:
       - broker
+    environment:
+      # Allow sub-5s dashboard auto-refresh (default floor is 5s) for the live feel.
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
