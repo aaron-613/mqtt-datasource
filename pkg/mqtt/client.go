@@ -111,6 +111,10 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 
 	clientID := o.ClientID
 	if clientID == "" {
+		// A random client ID keeps each connection unique — including across active-active HA
+		// Grafana nodes, where a stable per-datasource ID would collide and the nodes would
+		// take the connection from one another. With the clean session below it never
+		// accumulates broker-side. (Set a fixed Client ID in the datasource config to override.)
 		clientID = fmt.Sprintf("grafana_%d", rand.Int())
 	}
 	opts.SetClientID(clientID)
@@ -146,7 +150,11 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	opts.SetPingTimeout(60 * time.Second)
 	opts.SetKeepAlive(60 * time.Second)
 	opts.SetAutoReconnect(true)
-	opts.SetCleanSession(false)
+	// Use a clean session. All subscriptions are QoS 0 (at most once), so a persistent
+	// session would queue nothing for redelivery — its only effect here would be durable
+	// session state accumulating on the broker for every (randomly-named) client that ever
+	// connected, which never gets resumed or cleaned up. paho re-subscribes on reconnect.
+	opts.SetCleanSession(true)
 	opts.SetMaxReconnectInterval(10 * time.Second)
 	opts.SetConnectionLostHandler(func(c paho.Client, err error) {
 		logger.Warn("MQTT Connection lost", "error", err)
