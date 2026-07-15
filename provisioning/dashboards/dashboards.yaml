@@ -5,7 +5,9 @@ providers:
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
-    allowUiUpdates: true
+    # Keep the JSON files the source of truth: UI edits to provisioned dashboards revert on
+    # the next scan, rather than persisting in the DB and shadowing the file across restarts.
+    allowUiUpdates: false
     options:
       path: /etc/grafana/provisioning/dashboards
       foldersFromFilesStructure: false
