@@ -123,6 +123,27 @@ export const ConfigEditor = (props: DataSourcePluginOptionsEditorProps<MqttDataS
 
       <Divider />
 
+      <ConfigSection title="Streaming">
+        <Field
+          label="Grace period (s)"
+          description="How long a panel's subscription and recent-history buffer are kept after it stops viewing. A zoom, pan, or refresh briefly tears the stream down and re-establishes it, so this window lets it reseed from recent history instead of blanking. Shorter = subscriptions clean up on the broker sooner; longer = returning to a panel within the window keeps its history. Default 30."
+        >
+          <Input
+            width={WIDTH_LONG}
+            name="Grace period"
+            type="number"
+            value={jsonData.graceSeconds?.toString() ?? ''}
+            onChange={(e) => {
+              const n = parseInt(e.currentTarget.value, 10);
+              updateDatasourcePluginJsonDataOption(props, 'graceSeconds', isNaN(n) ? undefined : n);
+            }}
+            placeholder="30"
+          />
+        </Field>
+      </ConfigSection>
+
+      <Divider />
+
       <ConfigSection title="Authentication">
         <Field label="Username">
           <Input

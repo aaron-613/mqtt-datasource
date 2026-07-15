@@ -27,45 +27,79 @@ const LABEL_SOURCES: Array<ComboboxOption<string>> = [
   { label: 'Custom', value: 'custom' },
 ];
 
-const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => (
-  <>
-    <InlineFieldRow>
-      <InlineField label="Topic" labelWidth={LABEL_WIDTH} grow>
-        <Input
-          name="topic"
-          required
-          placeholder='e.g. "home/bedroom/temperature"'
-          value={query.topic}
-          onBlur={onRunQuery}
-          onChange={(e) => onChange({ ...query, topic: e.currentTarget.value })}
-        />
-      </InlineField>
-    </InlineFieldRow>
-    <InlineFieldRow>
-      <InlineField
-        label="Fields"
-        labelWidth={LABEL_WIDTH}
-        grow
-        tooltip="Optional. One JSON leaf path per line (dot notation, e.g. stats.totalTimeMs). Leave empty to graph every top-level key."
-      >
-        <TextArea
-          name="fields"
-          rows={3}
-          placeholder={'stats.totalTimeMs\nstats.objectCount'}
-          defaultValue={(query.fields ?? []).join('\n')}
-          onBlur={(e) => {
-            onChange({ ...query, fields: parseFields(e.currentTarget.value) });
-            onRunQuery();
-          }}
-        />
-      </InlineField>
-    </InlineFieldRow>
-  </>
-);
+// useTopicDraft gives the Topic input commit-on-blur behavior: typing updates only a local
+// draft, so the query model — and therefore any MQTT subscribe — changes ONLY when the user
+// commits (blur or Enter), never on each keystroke. Without this, Grafana re-runs the query on
+// every model change, leaving a trail of intermediate subscriptions on the broker while typing.
+const useTopicDraft = (query: MqttQuery, onChange: (q: MqttQuery) => void, onRunQuery: () => void) => {
+  const [topicDraft, setTopicDraft] = useState(query.topic ?? '');
+  useEffect(() => {
+    // Sync when the topic changes externally (e.g. picking from Browse, or a dashboard reload).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTopicDraft(query.topic ?? '');
+  }, [query.topic]);
+  const commitTopic = () => {
+    const next = topicDraft.trim();
+    if (next !== (query.topic ?? '')) {
+      onChange({ ...query, topic: next });
+    }
+    onRunQuery();
+  };
+  return { topicDraft, setTopicDraft, commitTopic };
+};
+
+// commitOnEnter blurs the input when Enter is pressed, so Enter commits like leaving the field.
+const commitOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  if (e.key === 'Enter') {
+    e.currentTarget.blur();
+  }
+};
+
+const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => {
+  const { topicDraft, setTopicDraft, commitTopic } = useTopicDraft(query, onChange, onRunQuery);
+  return (
+    <>
+      <InlineFieldRow>
+        <InlineField label="Topic" labelWidth={LABEL_WIDTH} grow>
+          <Input
+            name="topic"
+            required
+            placeholder='e.g. "home/bedroom/temperature"'
+            value={topicDraft}
+            onChange={(e) => setTopicDraft(e.currentTarget.value)}
+            onKeyDown={commitOnEnter}
+            onBlur={commitTopic}
+          />
+        </InlineField>
+      </InlineFieldRow>
+      <InlineFieldRow>
+        <InlineField
+          label="Fields"
+          labelWidth={LABEL_WIDTH}
+          grow
+          tooltip="Optional. One JSON leaf path per line (dot notation, e.g. stats.totalTimeMs). Leave empty to graph every top-level key."
+        >
+          <TextArea
+            name="fields"
+            rows={3}
+            placeholder={'stats.totalTimeMs\nstats.objectCount'}
+            defaultValue={(query.fields ?? []).join('\n')}
+            onBlur={(e) => {
+              onChange({ ...query, fields: parseFields(e.currentTarget.value) });
+              onRunQuery();
+            }}
+          />
+        </InlineField>
+      </InlineFieldRow>
+    </>
+  );
+};
 
 const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => {
   const fields = query.fields ?? [];
-  const isWildcard = /[+#]/.test(query.topic ?? '');
+
+  const { topicDraft, setTopicDraft, commitTopic } = useTopicDraft(query, onChange, onRunQuery);
+  const isWildcard = /[+#]/.test(topicDraft);
 
   // Keep-alive: while this editor is mounted, ping /topics so the backend keeps the
   // discovery subscription open (it lapses ~30s after the last ping). The returned count
@@ -92,9 +126,9 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
   const rootPrefixes = datasource.rootTopics;
   const outsideRoot =
     datasource.restrictTopics &&
-    !!query.topic &&
+    !!topicDraft &&
     rootPrefixes.length > 0 &&
-    !rootPrefixes.some((p) => query.topic!.startsWith(p));
+    !rootPrefixes.some((p) => topicDraft.startsWith(p));
 
   const loadTopics = async (input: string): Promise<Array<ComboboxOption<string>>> => {
     const topics = await datasource.getResource<string[]>('topics');
@@ -204,10 +238,11 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
           tooltip="Type a concrete topic or a wildcard pattern (+ / #). Use Browse to pick a discovered topic."
         >
           <Input
-            value={query.topic ?? ''}
+            value={topicDraft}
             placeholder="topic or wildcard, e.g. mqtt/PUMP/+/POLLER_STAT/VPN/queue_rates"
-            onChange={(e) => onChange({ ...query, topic: e.currentTarget.value })}
-            onBlur={onRunQuery}
+            onChange={(e) => setTopicDraft(e.currentTarget.value)}
+            onKeyDown={commitOnEnter}
+            onBlur={commitTopic}
           />
         </InlineField>
         {isWildcard && (

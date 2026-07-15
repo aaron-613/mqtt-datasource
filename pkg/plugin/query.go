@@ -99,7 +99,10 @@ func (ds *MQTTDatasource) queryWildcard(t *mqtt.Topic, pattern string) backend.D
 		topic, matched string
 	}
 	var matches []candidate
-	for _, concrete := range ds.Client.ListTopics() {
+	// Enumerate from the panel's OWN wildcard subscription (opened here), not the discovery
+	// registry — so wildcard panels work on view-only dashboards with no discovery running,
+	// and one subscription feeds all matching series.
+	for _, concrete := range ds.Client.EnsureWildcard(pattern) {
 		matched, ok := mqtt.MatchTopic(pattern, concrete)
 		if !ok {
 			continue
@@ -140,6 +143,7 @@ func (ds *MQTTDatasource) queryWildcard(t *mqtt.Topic, pattern string) backend.D
 			LabelSource:  t.LabelSource,
 			LabelValue:   t.LabelValue,
 			SeriesName:   m.matched,
+			EnumeratedBy: pattern, // scopes coverage to THIS wildcard sub, not any matching one
 			Interval:     t.Interval,
 		}
 		topic := ds.Client.EnsureTopic(ct)

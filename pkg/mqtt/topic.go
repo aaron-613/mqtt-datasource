@@ -36,6 +36,7 @@ type Topic struct {
 	LabelSource  string            `json:"labelSource,omitempty"`  // series-label source: "topic" (default) | "payload" | "custom"
 	LabelValue   string            `json:"labelValue,omitempty"`   // meaning depends on LabelSource: level indices / payload path / literal
 	SeriesName   string            `json:"-"`                      // wildcard-matched segment(s); the topic-source default when LabelValue is empty
+	EnumeratedBy string            `json:"-"`                      // wildcard pattern that enumerated this series (scopes coverage); empty for classic queries
 	Interval     time.Duration     `json:"-"`
 	Window       time.Duration `json:"-"` // ring buffer retention window
 	Messages     []Message     `json:"-"` // retained ring buffer (also the source for streamed deltas)
@@ -53,6 +54,13 @@ type streamState struct {
 	pahoSubscribed bool      // whether an MQTT subscription is currently open for this topic
 	attachedCount  int       // number of active RunStream consumers
 	detachedAt     time.Time // when attachedCount last dropped to 0 (for janitor cleanup)
+	// enumeratedBy is the wildcard pattern (if any) whose queryWildcard produced this series;
+	// it scopes coverage so the series attaches only to that pattern's shared subscription.
+	// coveredByPattern is set (to that filter) once the series is actually attached to the
+	// shared wildcard subscription instead of its own per-topic subscription; empty for classic
+	// single-topic subscriptions. Used to release the wildcard sub's refcount on detach.
+	enumeratedBy     string
+	coveredByPattern string
 }
 
 // newStreamTopic builds a Topic with buffering/streaming state initialized.
@@ -402,4 +410,10 @@ func decodeTopic(topicPath string, logger log.Logger) (string, error) {
 	}
 
 	return string(decoded), nil
+}
+
+// encodeTopic is the inverse of decodeTopic for a single topic name: URL-safe base64, matching
+// the frontend's channel encoding and the Topic.Path key used by TopicMap.AddMessage.
+func encodeTopic(topic string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(topic))
 }

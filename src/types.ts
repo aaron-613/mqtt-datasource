@@ -35,6 +35,9 @@ export interface MqttDataSourceOptions extends DataSourceJsonData {
   // Restrict topics: scope queries to rootTopic. Out-of-scope topics are soft-rejected
   // (backend notice + editor warning). A tidiness guardrail, not security. Default off.
   restrictTopics?: boolean;
+  // How long (seconds) a subscription + recent-history buffer is kept after a panel stops
+  // viewing, so a zoom/pan/refresh reseeds instead of blanking. 0/unset = default (30s).
+  graceSeconds?: number;
 }
 
 export interface MqttSecureJsonData {

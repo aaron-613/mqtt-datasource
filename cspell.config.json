@@ -47,6 +47,10 @@
     "statspump",
     "semp",
     "aedes",
-    "httpadapter"
+    "httpadapter",
+    "demux",
+    "demuxes",
+    "idempotent",
+    "idempotently"
   ]
 }

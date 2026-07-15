@@ -229,7 +229,7 @@ func TestClient_Janitor_RetainsRecentDropsStale(t *testing.T) {
 	// Detached longer than the grace period, no live MQTT sub -> should be swept.
 	stale := newStreamTopic("dGVzdA", time.Second, nil, time.Hour)
 	stale.StreamingKey = "s/stale"
-	stale.stream.detachedAt = time.Now().Add(-2 * detachGracePeriod)
+	stale.stream.detachedAt = time.Now().Add(-2 * defaultGracePeriod)
 	c.topics.Store(stale)
 
 	// Detached but within grace (e.g. mid-zoom) -> must be retained.

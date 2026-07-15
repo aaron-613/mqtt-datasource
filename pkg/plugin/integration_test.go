@@ -229,6 +229,7 @@ func TestStreamingKeyIntegration_MessageIsolation(t *testing.T) {
 type mockMQTTClient struct {
 	topics        map[string]*mqtt.Topic
 	subscriptions map[string]bool
+	wildcardSeen  []string // concrete topics EnsureWildcard should return
 }
 
 func (m *mockMQTTClient) GetTopic(reqPath string) (*mqtt.Topic, bool) {
@@ -247,6 +248,7 @@ func (m *mockMQTTClient) EnsureTopic(t *mqtt.Topic) *mqtt.Topic {
 func (m *mockMQTTClient) ListTopics() []string            { return nil }
 func (m *mockMQTTClient) SampleFor(string) ([]byte, bool) { return nil, false }
 func (m *mockMQTTClient) StartDiscovery()                 {}
+func (m *mockMQTTClient) EnsureWildcard(string) []string  { return m.wildcardSeen }
 
 func (m *mockMQTTClient) IsConnected() bool {
 	return true
