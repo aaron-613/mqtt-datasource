@@ -11,10 +11,24 @@ import { getLiveStreamKey } from './streaming';
 
 export class DataSource extends DataSourceWithBackend<MqttQuery, MqttDataSourceOptions> {
   readonly discoveryMode: boolean;
+  readonly restrictTopics: boolean;
+  // Non-wildcard prefixes parsed from the configured root topic(s), used by the query
+  // editor to warn when a typed topic falls outside the allowed scope.
+  readonly rootTopics: string[];
 
   constructor(instanceSettings: DataSourceInstanceSettings<MqttDataSourceOptions>) {
     super(instanceSettings);
     this.discoveryMode = !!instanceSettings.jsonData?.discoveryMode;
+    this.restrictTopics = !!instanceSettings.jsonData?.restrictTopics;
+    this.rootTopics = (instanceSettings.jsonData?.rootTopic ?? '')
+      .split(',')
+      .map((r) => r.trim())
+      .filter((r) => r.length > 0)
+      // Strip from the first wildcard so the guardrail is a plain prefix check.
+      .map((r) => {
+        const i = r.search(/[+#]/);
+        return i >= 0 ? r.slice(0, i) : r;
+      });
   }
 
   query(request: DataQueryRequest<MqttQuery>): Observable<DataQueryResponse> {

@@ -8,7 +8,7 @@ import {
   updateDatasourcePluginResetOption,
 } from '@grafana/data';
 import { ConfigSection, DataSourceDescription } from '@grafana/plugin-ui';
-import { Field, Input, SecretInput, SecureSocksProxySettings, Switch } from '@grafana/ui';
+import { Alert, Field, Input, SecretInput, SecureSocksProxySettings, Switch } from '@grafana/ui';
 import { Divider } from './Divider';
 import { TLSSecretsConfig } from './TLSConfig';
 import { MqttDataSourceOptions, MqttSecureJsonData } from './types';
@@ -68,16 +68,32 @@ export const ConfigEditor = (props: DataSourcePluginOptionsEditorProps<MqttDataS
       <ConfigSection title="Discovery">
         <Field
           label="Discovery mode"
-          description="Subscribe to a root topic wildcard and offer topic/field pick-lists in the query editor instead of hand-typed topics."
+          description="Subscribe to a root topic wildcard (while a query editor is open) and offer topic/field pick-lists in the query editor instead of hand-typed topics."
         >
           <Switch onChange={onSwitchChanged('discoveryMode')} value={jsonData.discoveryMode || false} />
         </Field>
 
         {jsonData.discoveryMode ? (
+          <Alert severity="info" title="Discovery ingests live data while editing">
+            While a query editor is open, discovery subscribes to the configured root topic(s) and receives every
+            matching message to build the topic/field pick-lists. A broad root (e.g. <code>#</code>) on a busy broker can
+            pull a large volume of traffic — and at a high rate if many topics match. Scope the root(s) as narrowly as
+            practical.
+          </Alert>
+        ) : null}
+
+        <Field
+          label="Restrict topics"
+          description="Scope queries to the root topic(s) below. Topics outside the root(s) are soft-rejected with a warning. A tidiness guardrail, not a security boundary."
+        >
+          <Switch onChange={onSwitchChanged('restrictTopics')} value={jsonData.restrictTopics || false} />
+        </Field>
+
+        {jsonData.discoveryMode || jsonData.restrictTopics ? (
           <>
             <Field
               label="Root topic(s)"
-              description='Wildcard subscription(s) used to discover topics — comma-separate for multiple, e.g. "mqtt/PUMP/#, sensors/#".'
+              description='The scope for discovery and/or restriction — wildcard filter(s), comma-separated for multiple, e.g. "mqtt/PUMP/#, sensors/#".'
             >
               <Input
                 width={WIDTH_LONG}

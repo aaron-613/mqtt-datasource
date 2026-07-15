@@ -40,6 +40,8 @@ func NewMQTTInstance(ctx context.Context, s backend.DataSourceInstanceSettings) 
 	if settings.MaxSeries > 0 {
 		ds.maxSeries = settings.MaxSeries
 	}
+	ds.restrictTopics = settings.RestrictTopics
+	ds.roots = mqtt.SplitRoots(settings.RootTopic)
 	return ds, nil
 }
 
@@ -51,6 +53,12 @@ type MQTTDatasource struct {
 	Client        mqtt.Client
 	channelPrefix string
 	maxSeries     int
+
+	// restrictTopics, when set, scopes queries to roots: an out-of-scope topic is
+	// soft-rejected in query() with a notice rather than subscribed. roots holds the
+	// configured root filters (also the discovery scope).
+	restrictTopics bool
+	roots          []string
 
 	// CallResourceHandler serves the discovery resource endpoints (/topics, /fields)
 	// that the query editor's pick-lists fetch from.
@@ -71,8 +79,10 @@ func NewMQTTDatasource(client mqtt.Client, uid string) *MQTTDatasource {
 	return ds
 }
 
-// handleTopics returns the topics discovered on the root wildcard subscription.
+// handleTopics returns the topics discovered on the root wildcard subscription. It also
+// acts as the discovery keep-alive: an open query editor polls it, refreshing the lease.
 func (ds *MQTTDatasource) handleTopics(w http.ResponseWriter, _ *http.Request) {
+	ds.Client.StartDiscovery()
 	writeJSON(w, ds.Client.ListTopics())
 }
 
@@ -80,6 +90,7 @@ func (ds *MQTTDatasource) handleTopics(w http.ResponseWriter, _ *http.Request) {
 // payload (e.g. stats.total-time-ms), for the field multi-select. Expects the raw
 // (non-base64) topic as the ?topic= query parameter.
 func (ds *MQTTDatasource) handleFields(w http.ResponseWriter, r *http.Request) {
+	ds.Client.StartDiscovery()
 	topic := r.URL.Query().Get("topic")
 	sample, ok := ds.sampleForTopic(topic)
 	if !ok {

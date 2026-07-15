@@ -50,9 +50,24 @@ func (ds *MQTTDatasource) query(query backend.DataQuery) backend.DataResponse {
 
 	t.Interval = streamFlushInterval
 
+	decoded, decodeErr := decodePath(t.Path)
+
+	// Governance guardrail: when the datasource restricts topics, soft-reject a topic (or
+	// wildcard pattern) that isn't under any configured root — return a notice instead of
+	// subscribing. Not security; the editor also surfaces this inline.
+	if ds.restrictTopics && decodeErr == nil && !mqtt.UnderRoot(decoded, ds.roots) {
+		frame := data.NewFrame("")
+		frame.SetMeta(&data.FrameMeta{Notices: []data.Notice{{
+			Severity: data.NoticeSeverityWarning,
+			Text:     fmt.Sprintf("Topic %q is outside the datasource's allowed root(s); not subscribing.", decoded),
+		}}})
+		response.Frames = append(response.Frames, frame)
+		return response
+	}
+
 	// A wildcard topic (+/#) fans out into one series per matching concrete topic.
-	if pattern, err := decodePath(t.Path); err == nil && mqtt.IsWildcard(pattern) {
-		return ds.queryWildcard(&t, pattern)
+	if decodeErr == nil && mqtt.IsWildcard(decoded) {
+		return ds.queryWildcard(&t, decoded)
 	}
 
 	// Single concrete topic: register it (field selection + ring buffer) and seed the

@@ -24,6 +24,7 @@ type Client interface {
 	Unsubscribe(string, log.Logger) error
 	ListTopics() []string
 	SampleFor(string) ([]byte, bool)
+	StartDiscovery()
 	Dispose()
 }
 
@@ -43,6 +44,10 @@ type Options struct {
 	RootTopic     string `json:"rootTopic"`
 	// MaxSeries caps how many concrete topics a wildcard query fans out into (0 = default).
 	MaxSeries int `json:"maxSeries"`
+	// RestrictTopics, when enabled, scopes queries to the configured root(s): a topic
+	// outside every root is soft-rejected (a notice, not a subscription). A tidiness
+	// guardrail, not security.
+	RestrictTopics bool `json:"restrictTopics"`
 }
 
 // detachGracePeriod is how long a topic's ring buffer (and its MQTT subscription) is
@@ -55,6 +60,11 @@ const (
 	// maxDiscoveredTopics bounds the discovery registry so a broad wildcard can't grow
 	// it without limit.
 	maxDiscoveredTopics = 2000
+	// discoveryLeaseTTL is how long a StartDiscovery ping keeps the root subscription
+	// alive; discoveryReapInterval is how often the janitor checks whether the lease has
+	// lapsed. The editor pings well inside the TTL so the lease stays warm while open.
+	discoveryLeaseTTL     = 30 * time.Second
+	discoveryReapInterval = 10 * time.Second
 )
 
 type client struct {
@@ -70,6 +80,27 @@ type client struct {
 	discMu     sync.RWMutex
 	discovered map[string][]byte
 	discOrder  []string
+
+	// Discovery lifecycle: the root subscription runs on demand — StartDiscovery (driven
+	// by the editor's keep-alive pings) subscribes and bumps the lease; reapDiscovery
+	// unsubscribes once the lease lapses. discoveryUntil and discoverySubscribed are
+	// guarded by discMu. The discovered cache survives a lapse so pick-lists still render.
+	discoveryMode       bool
+	discoveryRoots      []string
+	discoveryUntil      time.Time
+	discoverySubscribed bool
+}
+
+// SplitRoots parses a comma-separated list of root topic filters into trimmed,
+// non-empty entries.
+func SplitRoots(s string) []string {
+	var roots []string
+	for _, rt := range strings.Split(s, ",") {
+		if rt = strings.TrimSpace(rt); rt != "" {
+			roots = append(roots, rt)
+		}
+	}
+	return roots
 }
 
 func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstanceSettings) (Client, error) {
@@ -137,30 +168,71 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	}
 
 	c := &client{
-		client:     pahoClient,
-		done:       make(chan struct{}),
-		discovered: make(map[string][]byte),
+		client:         pahoClient,
+		done:           make(chan struct{}),
+		discovered:     make(map[string][]byte),
+		discoveryMode:  o.DiscoveryMode,
+		discoveryRoots: SplitRoots(o.RootTopic),
 	}
 	go c.janitor()
 
-	if o.DiscoveryMode {
-		// RootTopic may list several wildcard filters, comma-separated.
-		handler := func(_ paho.Client, m paho.Message) {
-			c.recordDiscovered(m.Topic(), m.Payload())
-		}
-		for _, rt := range strings.Split(o.RootTopic, ",") {
-			rt = strings.TrimSpace(rt)
-			if rt == "" {
-				continue
-			}
-			logger.Info("MQTT discovery subscribing", "rootTopic", rt)
-			if token := pahoClient.Subscribe(rt, 0, handler); token.Wait() && token.Error() != nil {
-				// Discovery is best-effort; a bad root topic shouldn't fail the datasource.
-				logger.Warn("MQTT discovery subscribe failed", "rootTopic", rt, "error", token.Error())
-			}
+	return c, nil
+}
+
+// StartDiscovery is the keep-alive for on-demand discovery: the query editor's resource
+// calls (/topics, /fields) invoke it while an editor is open. It bumps the lease and, on
+// the first call (or after a lapse), subscribes to each root wildcard so the discovery
+// registry fills. It is a no-op when discovery is disabled or no roots are configured.
+func (c *client) StartDiscovery() {
+	if !c.discoveryMode || len(c.discoveryRoots) == 0 {
+		return
+	}
+
+	c.discMu.Lock()
+	c.discoveryUntil = time.Now().Add(discoveryLeaseTTL)
+	needSubscribe := !c.discoverySubscribed
+	c.discoverySubscribed = true
+	c.discMu.Unlock()
+
+	if !needSubscribe {
+		return
+	}
+
+	// Subscribe outside the lock: paho's token.Wait() can block on the network, and
+	// discMu is taken on the recordDiscovered hot path.
+	handler := func(_ paho.Client, m paho.Message) {
+		c.recordDiscovered(m.Topic(), m.Payload())
+	}
+	for _, rt := range c.discoveryRoots {
+		log.DefaultLogger.Info("MQTT discovery subscribing", "rootTopic", rt)
+		if token := c.client.Subscribe(rt, 0, handler); token.Wait() && token.Error() != nil {
+			// Discovery is best-effort; a bad root topic shouldn't fail the datasource.
+			log.DefaultLogger.Warn("MQTT discovery subscribe failed", "rootTopic", rt, "error", token.Error())
 		}
 	}
-	return c, nil
+}
+
+// reapDiscovery unsubscribes from the root wildcards once the keep-alive lease has
+// lapsed, stopping the firehose. The discovered cache is retained so pick-lists still
+// render (stale) until the next StartDiscovery tops it up.
+func (c *client) reapDiscovery() {
+	c.discMu.Lock()
+	lapsed := c.discoverySubscribed && time.Now().After(c.discoveryUntil)
+	if lapsed {
+		c.discoverySubscribed = false
+	}
+	roots := c.discoveryRoots
+	c.discMu.Unlock()
+
+	if !lapsed {
+		return
+	}
+
+	// Unsubscribe outside the lock (see StartDiscovery).
+	for _, rt := range roots {
+		c.client.Unsubscribe(rt)
+	}
+	log.DefaultLogger.Info("MQTT discovery lapsed", "roots", roots)
 }
 
 // recordDiscovered stores the latest sample payload for a concrete topic seen on the
@@ -208,12 +280,16 @@ func (c *client) SampleFor(topic string) ([]byte, bool) {
 func (c *client) janitor() {
 	ticker := time.NewTicker(janitorInterval)
 	defer ticker.Stop()
+	discoveryTicker := time.NewTicker(discoveryReapInterval)
+	defer discoveryTicker.Stop()
 	for {
 		select {
 		case <-c.done:
 			return
 		case <-ticker.C:
 			c.sweep()
+		case <-discoveryTicker.C:
+			c.reapDiscovery()
 		}
 	}
 }

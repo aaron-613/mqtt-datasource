@@ -50,6 +50,51 @@ func TestMatchTopic(t *testing.T) {
 	}
 }
 
+func TestRootPrefix(t *testing.T) {
+	for _, c := range []struct {
+		root string
+		want string
+	}{
+		{"mqtt/PUMP/#", "mqtt/PUMP/"},
+		{"a/+/c", "a/"},
+		{"mqtt/PUMP/solace1025/POLLER_STAT/VPN/+/queue_rates", "mqtt/PUMP/solace1025/POLLER_STAT/VPN/"},
+		{"no/wildcard/here", "no/wildcard/here"}, // no wildcard -> unchanged
+		{"#", ""},
+	} {
+		if got := rootPrefix(c.root); got != c.want {
+			t.Errorf("rootPrefix(%q) = %q, want %q", c.root, got, c.want)
+		}
+	}
+}
+
+func TestUnderRoot(t *testing.T) {
+	for _, c := range []struct {
+		topic string
+		roots []string
+		want  bool
+	}{
+		// no roots configured -> unrestricted
+		{"anything/goes", nil, true},
+		{"anything/goes", []string{}, true},
+		// single root
+		{"mqtt/PUMP/solace1025/x", []string{"mqtt/PUMP/#"}, true},
+		{"mqtt/OTHER/x", []string{"mqtt/PUMP/#"}, false},
+		// exact prefix boundary
+		{"mqtt/PUMP/", []string{"mqtt/PUMP/#"}, true},
+		// multiple roots -> under any
+		{"sensors/kitchen/temp", []string{"mqtt/PUMP/#", "sensors/#"}, true},
+		{"other/thing", []string{"mqtt/PUMP/#", "sensors/#"}, false},
+		// no-wildcard root behaves as exact/prefix
+		{"a/b/c", []string{"a/b/c"}, true},
+		{"a/b/cd", []string{"a/b/c"}, true}, // prefix guardrail, not exact
+		{"a/b", []string{"a/b/c"}, false},
+	} {
+		if got := UnderRoot(c.topic, c.roots); got != c.want {
+			t.Errorf("UnderRoot(%q, %v) = %v, want %v", c.topic, c.roots, got, c.want)
+		}
+	}
+}
+
 func TestIsWildcard(t *testing.T) {
 	for _, c := range []struct {
 		s    string

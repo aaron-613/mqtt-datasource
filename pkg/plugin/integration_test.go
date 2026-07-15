@@ -246,6 +246,7 @@ func (m *mockMQTTClient) EnsureTopic(t *mqtt.Topic) *mqtt.Topic {
 
 func (m *mockMQTTClient) ListTopics() []string            { return nil }
 func (m *mockMQTTClient) SampleFor(string) ([]byte, bool) { return nil, false }
+func (m *mockMQTTClient) StartDiscovery()                 {}
 
 func (m *mockMQTTClient) IsConnected() bool {
 	return true

@@ -1,5 +1,5 @@
-import React from 'react';
-import { Input, InlineFieldRow, InlineField, TextArea, Combobox, ComboboxOption, IconButton } from '@grafana/ui';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Alert, Input, InlineFieldRow, InlineField, TextArea, Combobox, ComboboxOption, IconButton } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { MqttDataSourceOptions, MqttQuery } from './types';
@@ -7,6 +7,10 @@ import { MqttDataSourceOptions, MqttQuery } from './types';
 type Props = QueryEditorProps<DataSource, MqttQuery, MqttDataSourceOptions>;
 
 const LABEL_WIDTH = 14;
+
+// How often the open editor pings /topics to keep the backend's discovery lease warm
+// (backend discoveryLeaseTTL is 30s, so 10s stays comfortably inside it).
+const DISCOVERY_PING_MS = 10000;
 
 // Parse the multi-line/comma-separated Fields input into a clean list of leaf paths.
 const parseFields = (raw: string): string[] =>
@@ -62,6 +66,35 @@ const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => (
 const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => {
   const fields = query.fields ?? [];
   const isWildcard = /[+#]/.test(query.topic ?? '');
+
+  // Keep-alive: while this editor is mounted, ping /topics so the backend keeps the
+  // discovery subscription open (it lapses ~30s after the last ping). The returned count
+  // feeds the hint line below.
+  const [topicCount, setTopicCount] = useState<number | null>(null);
+  const ping = useCallback(async () => {
+    try {
+      const topics = await datasource.getResource<string[]>('topics');
+      setTopicCount(topics.length);
+    } catch {
+      // best-effort keep-alive; ignore transient failures
+    }
+  }, [datasource]);
+
+  useEffect(() => {
+    // ping() only setState()s after an await (the /topics fetch), so this is a genuine
+    // external-system sync, not the synchronous cascading render the rule guards against.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    ping();
+    const id = setInterval(ping, DISCOVERY_PING_MS);
+    return () => clearInterval(id);
+  }, [ping]);
+
+  const rootPrefixes = datasource.rootTopics;
+  const outsideRoot =
+    datasource.restrictTopics &&
+    !!query.topic &&
+    rootPrefixes.length > 0 &&
+    !rootPrefixes.some((p) => query.topic!.startsWith(p));
 
   const loadTopics = async (input: string): Promise<Array<ComboboxOption<string>>> => {
     const topics = await datasource.getResource<string[]>('topics');
@@ -189,6 +222,15 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
         )}
       </InlineFieldRow>
 
+      {outsideRoot && (
+        <InlineFieldRow>
+          <Alert severity="warning" title="Topic outside the allowed root(s)">
+            This topic is not under the datasource&apos;s restricted root(s) ({rootPrefixes.join(', ')}). It will not be
+            subscribed until it&apos;s in scope.
+          </Alert>
+        </InlineFieldRow>
+      )}
+
       <InlineFieldRow>
         <InlineField
           label="Browse"
@@ -203,6 +245,13 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
             width={50}
           />
         </InlineField>
+        <IconButton name="sync" tooltip="Refresh discovered topics" onClick={ping} />
+        {topicCount !== null && (
+          <span style={{ alignSelf: 'center', marginLeft: 8, whiteSpace: 'nowrap', opacity: 0.75 }}>
+            {rootPrefixes.length > 0 ? `Discovering under ${rootPrefixes.join(', ')} — ` : 'Discovering — '}
+            {topicCount} topics
+          </span>
+        )}
       </InlineFieldRow>
 
       {fields.map((f, i) => (

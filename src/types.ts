@@ -32,6 +32,9 @@ export interface MqttDataSourceOptions extends DataSourceJsonData {
   rootTopic?: string;
   // Cap on how many concrete topics a wildcard query fans out into (default 100).
   maxSeries?: number;
+  // Restrict topics: scope queries to rootTopic. Out-of-scope topics are soft-rejected
+  // (backend notice + editor warning). A tidiness guardrail, not security. Default off.
+  restrictTopics?: boolean;
 }
 
 export interface MqttSecureJsonData {
