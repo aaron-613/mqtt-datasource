@@ -49,11 +49,16 @@ func TestLive_WildcardLifecycle(t *testing.T) {
 	reqPath := "1s/" + encodeTopic(seen[0]) + "/k"
 	top, err := c.Subscribe(reqPath, log.DefaultLogger)
 	require.NoError(t, err)
+	// The enumerated series rides the wildcard pattern's shared sub and opens no per-topic sub.
 	raw := top.stream.raw
 	raw.mu.Lock()
-	covered := raw.coveredByPattern
+	ownSub := raw.pahoSubscribed
 	raw.mu.Unlock()
-	require.Equal(t, pattern, covered, "concrete topic is covered by the wildcard sub, not its own")
+	require.False(t, ownSub, "a wildcard-enumerated topic must not open its own subscription")
+	top.stream.mu.Lock()
+	ref := top.stream.wildcardRef
+	top.stream.mu.Unlock()
+	require.Equal(t, pattern, ref, "the view rides the wildcard pattern's shared subscription")
 
 	require.Eventually(t, func() bool {
 		return top.bufferLen() > 0

@@ -203,10 +203,12 @@ func TestWildcard_CoverageAttachOnly(t *testing.T) {
 
 	raw := tp.stream.raw
 	raw.mu.Lock()
-	require.False(t, raw.pahoSubscribed)
-	require.Equal(t, "a/+/c", raw.coveredByPattern)
+	require.False(t, raw.pahoSubscribed, "a wildcard-covered topic has no own subscription")
 	require.Equal(t, 1, raw.refCount)
 	raw.mu.Unlock()
+	tp.stream.mu.Lock()
+	require.Equal(t, "a/+/c", tp.stream.wildcardRef, "the view rides the enumerating pattern's sub")
+	tp.stream.mu.Unlock()
 	require.Equal(t, 1, c.wildcards["a/+/c"].refCount)
 
 	require.NoError(t, c.Unsubscribe(reqPath, log.DefaultLogger))
@@ -283,13 +285,21 @@ func TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet(t *testing.T) {
 	require.Equal(t, 1, tp.bufferLen(), "the shared buffer is fed for the concrete view")
 }
 
-// TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard guards scoped coverage across the
-// shared raw: a concrete panel on a topic a wildcard also covers must open its OWN subscription
-// (never ride the wildcard firehose), regardless of attach order. A directly-typed topic stays
-// decoupled so removing the wildcard panel can't leave a firehose feeding it.
+// TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard: a concrete panel on a topic a wildcard
+// also covers always opens its OWN subscription (never absorbed into the wildcard firehose),
+// regardless of attach order. The wildcard-enumerated view independently rides its pattern's
+// subscription; the two feeds coexist (dispatch appends once per delivered message). There is no
+// order-dependent "upgrade" — a concrete view and a wildcard view simply keep their own feeds.
 func TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard(t *testing.T) {
 	concrete := "1s/" + encodeTopic("a/b") + "/kc"
 	wild := "1s/" + encodeTopic("a/b") + "/kw"
+
+	assertCoexist := func(t *testing.T, c *client, fp *fakePaho) {
+		raw := c.raws[encodeTopic("a/b")]
+		require.True(t, raw.pahoSubscribed, "concrete panel opens its own subscription")
+		require.Equal(t, []string{"a/b"}, fp.subscribed, "exactly one concrete broker sub for the topic")
+		require.Equal(t, 1, c.wildcards["a/+"].refCount, "the wildcard view independently holds its pattern ref")
+	}
 
 	t.Run("concrete first", func(t *testing.T) {
 		fp := &fakePaho{}
@@ -303,14 +313,10 @@ func TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard(t *testing.T) {
 		_, err = c.Subscribe(wild, log.DefaultLogger)
 		require.NoError(t, err)
 
-		raw := c.raws[encodeTopic("a/b")]
-		require.True(t, raw.pahoSubscribed, "concrete panel opens its own subscription")
-		require.Equal(t, "", raw.coveredByPattern, "not riding the wildcard")
-		require.Equal(t, []string{"a/b"}, fp.subscribed)
-		require.Equal(t, 0, c.wildcards["a/+"].refCount, "wildcard sub not held by the concrete topic")
+		assertCoexist(t, c, fp)
 	})
 
-	t.Run("wildcard first, concrete upgrades", func(t *testing.T) {
+	t.Run("wildcard first", func(t *testing.T) {
 		fp := &fakePaho{}
 		c := newWildcardTestClient(fp)
 		c.wildcards["a/+"] = &wildcardSub{seen: map[string]struct{}{}, pahoSubscribed: true}
@@ -319,18 +325,16 @@ func TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard(t *testing.T) {
 		_, err := c.Subscribe(wild, log.DefaultLogger)
 		require.NoError(t, err)
 		raw := c.raws[encodeTopic("a/b")]
-		require.Equal(t, "a/+", raw.coveredByPattern, "initially rides the wildcard")
+		require.False(t, raw.pahoSubscribed, "wildcard-only topic: no own subscription")
+		require.Empty(t, fp.subscribed, "wildcard-only topic opens no concrete sub")
 		require.Equal(t, 1, c.wildcards["a/+"].refCount)
 
-		// The concrete panel arrives -> upgrade to an own sub and release the coverage.
+		// A concrete panel arrives: it opens its own sub; the wildcard view keeps its ref. No upgrade.
 		c.EnsureTopic(&Topic{Path: encodeTopic("a/b"), Interval: time.Second, StreamingKey: "kc"})
 		_, err = c.Subscribe(concrete, log.DefaultLogger)
 		require.NoError(t, err)
 
-		require.True(t, raw.pahoSubscribed, "upgraded to its own subscription")
-		require.Equal(t, "", raw.coveredByPattern, "coverage released on upgrade")
-		require.Equal(t, []string{"a/b"}, fp.subscribed)
-		require.Equal(t, 0, c.wildcards["a/+"].refCount, "wildcard sub no longer held by this topic (no firehose coupling)")
+		assertCoexist(t, c, fp)
 	})
 }
 
@@ -359,7 +363,6 @@ func TestWildcard_UnrelatedConcreteNotAbsorbed(t *testing.T) {
 	require.Equal(t, []string{"a/b/c"}, fp.subscribed, "independent concrete panel opens its own sub despite a covering wildcard")
 	raw := tp.stream.raw
 	raw.mu.Lock()
-	require.Equal(t, "", raw.coveredByPattern)
 	require.True(t, raw.pahoSubscribed)
 	raw.mu.Unlock()
 	require.Equal(t, 0, c.wildcards["a/#"].refCount, "the broad wildcard sub is untouched by the concrete panel")

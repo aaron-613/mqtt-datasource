@@ -711,14 +711,13 @@ func (c *client) HandleMessage(topic string, payload []byte) {
 // refcount, all under rawMu. This cannot race the janitor's reap, which re-checks refCount==0 and
 // deletes under the SAME rawMu (+ raw.mu) — so a consumer re-attaching at grace expiry is always
 // seen and spared, and a reaped raw is never handed out (a fresh one is created instead). It
-// re-points the view at the returned live raw (which may differ from a cached, since-reaped one)
-// and returns a snapshot of the raw's feed state.
-func (c *client) ensureRawAttached(t *Topic, path string) (raw *rawTopic, ownSub bool, covered string) {
+// re-points the view at the returned live raw (which may differ from a cached, since-reaped one).
+func (c *client) ensureRawAttached(t *Topic, path string) *rawTopic {
 	c.rawMu.Lock()
 	if c.raws == nil {
 		c.raws = make(map[string]*rawTopic)
 	}
-	raw = c.raws[path]
+	raw := c.raws[path]
 	if raw == nil {
 		raw = newRawTopic(path, 0)
 		c.raws[path] = raw
@@ -726,15 +725,26 @@ func (c *client) ensureRawAttached(t *Topic, path string) (raw *rawTopic, ownSub
 	raw.mu.Lock()
 	raw.refCount++
 	raw.detachedAt = time.Time{}
-	ownSub = raw.pahoSubscribed
-	covered = raw.coveredByPattern
 	raw.mu.Unlock()
 	c.rawMu.Unlock()
 
 	t.stream.mu.Lock()
 	t.stream.raw = raw
 	t.stream.mu.Unlock()
-	return raw, ownSub, covered
+	return raw
+}
+
+// claimConcreteSub returns true if the caller must open this raw's own concrete subscription
+// (it was not already open); a false return means another consumer already opened it and this
+// one just rides it. Sets pahoSubscribed under the lock so concurrent attaches open it once.
+func (c *client) claimConcreteSub(raw *rawTopic) bool {
+	raw.mu.Lock()
+	defer raw.mu.Unlock()
+	if raw.pahoSubscribed {
+		return false
+	}
+	raw.pahoSubscribed = true
+	return true
 }
 
 func (c *client) GetTopic(reqPath string) (*Topic, bool) {
@@ -800,71 +810,33 @@ func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 	if !ok {
 		t = newStreamTopic(topicPath, interval, nil, 0)
 		t.StreamingKey = strings.Join(chunks[2:], "/")
-		t.stream.raw = c.ensureRaw(topicPath, 0)
 		c.topics.Map.Store(reqPath, t)
 	}
 	t.stream.mu.Lock()
 	hint := t.stream.enumeratedBy // per-view: the wildcard (if any) that enumerated THIS view
 	t.stream.mu.Unlock()
 
-	// Attach this consumer to the shared raw and establish its single feed. The attach (get-or-
-	// create + refCount++) is atomic under rawMu so it cannot race the janitor's reap. The feed is
-	// either the raw's own paho subscription or coverage by a wildcard pattern that enumerated a
-	// view (mutually exclusive; own-sub wins). N views/panels of one topic share the one feed, so
-	// reaping one view never starves the others (the feed lives while refCount > 0).
-	raw, ownSub, covered := c.ensureRawAttached(t, topicPath)
+	// Attach to the shared raw (atomic under rawMu, so it can't race the janitor's reap). Then
+	// ensure a feed keeps its buffer filled:
+	//   - a wildcard-enumerated view rides its pattern's shared subscription, which demuxes into
+	//     this raw via dispatch; it never opens a per-topic subscription.
+	//   - a concrete (directly-typed) view always opens its own per-topic subscription and is
+	//     never absorbed into a wildcard firehose. The two feeds may coexist for a topic graphed
+	//     both ways — dispatch still appends once per delivered message.
+	raw := c.ensureRawAttached(t, topicPath)
 
-	// Already fed by an own subscription -> every view just rides it.
-	if ownSub {
+	if hint != "" && c.attachWildcardExact(hint) {
+		t.stream.mu.Lock()
+		t.stream.wildcardRef = hint
+		t.stream.mu.Unlock()
 		return t, nil
 	}
-
-	// Concrete view (not enumerated by any wildcard): it must have its OWN subscription so a
-	// directly-typed topic is never silently absorbed into a wildcard firehose (scoped coverage).
-	// If the raw was riding a wildcard, upgrade it to an own sub and release that coverage.
-	if hint == "" {
-		raw.mu.Lock()
-		if raw.pahoSubscribed { // another consumer already opened it
-			raw.mu.Unlock()
-			return t, nil
-		}
-		release := raw.coveredByPattern
-		raw.coveredByPattern = ""
-		raw.pahoSubscribed = true
-		raw.mu.Unlock()
-		if release != "" {
-			c.detachWildcard(release)
-		}
+	// Concrete view, or a wildcard view whose pattern sub isn't currently active (reconnect
+	// race): ensure this topic has its own subscription.
+	if c.claimConcreteSub(raw) {
 		return c.openOwnSub(t, raw, topicPath, logger)
 	}
-
-	// Wildcard-enumerated view: ride the raw's existing wildcard coverage if any...
-	if covered != "" {
-		return t, nil
-	}
-	// ...otherwise ride the enumerating pattern's shared subscription if it is active.
-	if c.attachWildcardExact(hint) {
-		raw.mu.Lock()
-		if raw.pahoSubscribed {
-			// A concrete view opened an own sub meanwhile; it feeds the raw. Don't also hold the
-			// wildcard sub for this topic.
-			raw.mu.Unlock()
-			c.detachWildcard(hint)
-			return t, nil
-		}
-		raw.coveredByPattern = hint
-		raw.mu.Unlock()
-		return t, nil
-	}
-	// The enumerating wildcard sub isn't active (e.g. a reconnect race) -> open an own sub.
-	raw.mu.Lock()
-	if raw.pahoSubscribed {
-		raw.mu.Unlock()
-		return t, nil
-	}
-	raw.pahoSubscribed = true
-	raw.mu.Unlock()
-	return c.openOwnSub(t, raw, topicPath, logger)
+	return t, nil
 }
 
 // openOwnSub opens the one per-topic paho subscription that feeds the raw's shared buffer, with a
@@ -916,14 +888,17 @@ func (c *client) Unsubscribe(reqPath string, _ log.Logger) error {
 	if raw.refCount > 0 {
 		raw.refCount--
 	}
-	var pattern string
 	if raw.refCount == 0 {
 		raw.detachedAt = time.Now()
-		// Release the covering wildcard sub's reference once the LAST consumer detaches.
-		pattern = raw.coveredByPattern
-		raw.coveredByPattern = ""
 	}
 	raw.mu.Unlock()
+
+	// Release this view's own wildcard-subscription reference (if it was riding one), so that
+	// pattern's shared sub can be reaped once no enumerated series still need it.
+	t.stream.mu.Lock()
+	pattern := t.stream.wildcardRef
+	t.stream.wildcardRef = ""
+	t.stream.mu.Unlock()
 	if pattern != "" {
 		c.detachWildcard(pattern)
 	}

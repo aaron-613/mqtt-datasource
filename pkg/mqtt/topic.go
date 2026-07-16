@@ -58,13 +58,11 @@ type rawTopic struct {
 	window   time.Duration // ring-buffer retention window
 	messages []Message     // THE shared ring buffer (also the source for streamed deltas)
 
-	// Subscription ownership — one MQTT feed per topic, shared by every view. pahoSubscribed:
-	// an own per-topic paho subscription is open. coveredByPattern: non-empty means this topic
-	// is fed by a wildcard subscription (that exact pattern) instead of its own sub. The two are
-	// mutually exclusive as the raw's active feed; an own sub takes precedence (a concrete view
-	// upgrades a covered raw to its own sub — see Subscribe).
-	pahoSubscribed   bool
-	coveredByPattern string
+	// pahoSubscribed is true when THIS topic has its own concrete paho subscription open (opened
+	// for a directly-typed concrete view). A topic graphed only via a wildcard has no own sub —
+	// its messages arrive on the wildcard subscription and are demuxed here by dispatch. Both
+	// feeds land in this one buffer; dispatch appends once per delivered message either way.
+	pahoSubscribed bool
 
 	// refCount is the number of active RunStream consumers (across all views/field-selections
 	// of this topic). detachedAt is when it last dropped to 0, for janitor reaping past grace.
@@ -133,10 +131,13 @@ type streamState struct {
 	watermark time.Time // timestamp of the last message emitted to THIS view's stream
 	raw       *rawTopic // shared raw layer (buffer + subscription) for this view's Path
 	// enumeratedBy is the wildcard pattern (if any) whose queryWildcard produced THIS view;
-	// empty for a directly-typed concrete query. It scopes coverage per-view: a view rides a
-	// wildcard subscription only if that exact pattern enumerated it (a concrete view always
-	// opens its own subscription and is never absorbed into a wildcard firehose).
+	// empty for a directly-typed concrete query. A wildcard-enumerated view rides that pattern's
+	// shared subscription; a concrete view always opens its own subscription and is never
+	// absorbed into a wildcard firehose.
 	enumeratedBy string
+	// wildcardRef is the pattern this view currently holds a reference on (via attachWildcardExact),
+	// so Unsubscribe releases exactly that reference. Empty when the view uses its own concrete sub.
+	wildcardRef string
 }
 
 // newStreamTopic builds a Topic with view + a private raw layer initialized. Callers that
