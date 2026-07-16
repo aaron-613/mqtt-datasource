@@ -111,6 +111,12 @@ type client struct {
 	// gracePeriod is the retain-after-detach window (from Options.GraceSeconds, else default).
 	gracePeriod time.Duration
 
+	// raws is the shared RAW layer, keyed by Path (base64 topic) alone: one ring buffer per
+	// MQTT topic, shared across every field-selection/query (view) of that topic. topics (the
+	// view map) stays keyed by the full streaming Key(). Guarded by rawMu.
+	rawMu sync.RWMutex
+	raws  map[string]*rawTopic
+
 	// Wildcard graphing: a wildcard query opens ONE paho subscription to its OWN pattern
 	// (narrower than the discovery root) and demuxes each message by concrete topic into the
 	// per-series ring buffers — instead of one subscription per matched concrete topic. All
@@ -219,6 +225,7 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 		done:           make(chan struct{}),
 		discovered:     make(map[string][]byte),
 		wildcards:      make(map[string]*wildcardSub),
+		raws:           make(map[string]*rawTopic),
 		discoveryMode:  o.DiscoveryMode,
 		discoveryRoots: SplitRoots(o.RootTopic),
 		gracePeriod:    gracePeriod,
@@ -580,56 +587,89 @@ func (c *client) grace() time.Duration {
 
 func (c *client) sweep() {
 	type victim struct {
-		key    string
+		path   string
 		mqtt   string
 		hadSub bool
 	}
 	var victims []victim
-	c.topics.Range(func(key, v any) bool {
-		t, ok := v.(*Topic)
-		if !ok || t.stream == nil {
-			return true
-		}
-		t.stream.mu.Lock()
-		stale := t.stream.attachedCount == 0 && !t.stream.detachedAt.IsZero() &&
-			time.Since(t.stream.detachedAt) > c.grace()
-		hadSub := t.stream.pahoSubscribed
-		t.stream.mu.Unlock()
+	c.rawMu.RLock()
+	for path, r := range c.raws {
+		r.mu.Lock()
+		stale := r.refCount == 0 && !r.detachedAt.IsZero() && time.Since(r.detachedAt) > c.grace()
+		hadSub := r.pahoSubscribed
+		r.mu.Unlock()
 		if stale {
-			mqttTopic, err := decodeTopic(t.Path, log.DefaultLogger)
+			mqttTopic, err := decodeTopic(path, log.DefaultLogger)
 			if err == nil {
-				victims = append(victims, victim{key: key.(string), mqtt: mqttTopic, hadSub: hadSub})
+				victims = append(victims, victim{path: path, mqtt: mqttTopic, hadSub: hadSub})
 			}
 		}
-		return true
-	})
+	}
+	c.rawMu.RUnlock()
 
 	for _, vv := range victims {
-		// Re-check under lock so a topic that re-attached since the scan is spared.
-		t, ok := c.topics.Load(vv.key)
-		if !ok || t.stream == nil {
+		c.rawMu.RLock()
+		r := c.raws[vv.path]
+		c.rawMu.RUnlock()
+		if r == nil {
 			continue
 		}
-		t.stream.mu.Lock()
-		stillStale := t.stream.attachedCount == 0 && !t.stream.detachedAt.IsZero() &&
-			time.Since(t.stream.detachedAt) > c.grace()
+		// Re-check under the raw lock so a topic that re-attached since the scan is spared.
+		r.mu.Lock()
+		stillStale := r.refCount == 0 && !r.detachedAt.IsZero() && time.Since(r.detachedAt) > c.grace()
 		if stillStale {
-			t.stream.pahoSubscribed = false
+			r.pahoSubscribed = false
 		}
-		t.stream.mu.Unlock()
+		r.mu.Unlock()
 		if !stillStale {
 			continue
 		}
+		c.rawMu.Lock()
+		delete(c.raws, vv.path)
+		c.rawMu.Unlock()
 		if vv.hadSub {
 			c.client.Unsubscribe(vv.mqtt)
 		}
-		c.topics.Delete(vv.key)
-		log.DefaultLogger.Debug("janitor removed idle topic", "key", vv.key)
+		// Drop every view of this topic — they are idle (no active consumer holds the raw).
+		c.deleteViewsForPath(vv.path)
+		log.DefaultLogger.Debug("janitor removed idle topic", "path", vv.path)
+	}
+}
+
+// deleteViewsForPath removes all views (by Key) whose MQTT Path matches, when their shared raw
+// is reaped.
+func (c *client) deleteViewsForPath(path string) {
+	var keys []string
+	c.topics.Range(func(k, v any) bool {
+		if t, ok := v.(*Topic); ok && t.Path == path {
+			keys = append(keys, k.(string))
+		}
+		return true
+	})
+	for _, k := range keys {
+		c.topics.Delete(k)
 	}
 }
 
 func (c *client) IsConnected() bool {
 	return c.client.IsConnectionOpen()
+}
+
+// ensureRaw returns the shared raw layer for a Path (base64 topic), creating it if absent.
+// This is the single creation point for the shared ring buffer; every view of the same MQTT
+// topic points at the same rawTopic.
+func (c *client) ensureRaw(path string, window time.Duration) *rawTopic {
+	c.rawMu.Lock()
+	defer c.rawMu.Unlock()
+	if c.raws == nil {
+		c.raws = make(map[string]*rawTopic)
+	}
+	r := c.raws[path]
+	if r == nil {
+		r = newRawTopic(path, window)
+		c.raws[path] = r
+	}
+	return r
 }
 
 func (c *client) HandleMessage(topic string, payload []byte) {
@@ -638,7 +678,13 @@ func (c *client) HandleMessage(topic string, payload []byte) {
 		Value:     payload,
 	}
 
-	c.topics.AddMessage(topic, message)
+	// One append into the shared raw buffer for this Path; all views frame from it.
+	c.rawMu.RLock()
+	r := c.raws[topic]
+	c.rawMu.RUnlock()
+	if r != nil {
+		r.append(message)
+	}
 }
 
 func (c *client) GetTopic(reqPath string) (*Topic, bool) {
@@ -650,6 +696,9 @@ func (c *client) GetTopic(reqPath string) (*Topic, bool) {
 // calls this so the ring buffer and framer are configured before streaming starts;
 // the returned topic is the live instance stored in the map.
 func (c *client) EnsureTopic(t *Topic) *Topic {
+	// Ensure the shared raw layer (buffer + subscription) for this MQTT topic.
+	raw := c.ensureRaw(t.Path, 0)
+
 	if existing, ok := c.topics.Load(t.Key()); ok {
 		// A topic may already exist without the right field selection (e.g. created by
 		// the RunStream fallback on a Live reconnect before QueryData ran). Reconcile it.
@@ -659,42 +708,22 @@ func (c *client) EnsureTopic(t *Topic) *Topic {
 		existing.stream.mu.Unlock()
 		return existing
 	}
-	stored := newStreamTopic(t.Path, t.Interval, t.Fields, t.Window)
+	stored := newStreamTopic(t.Path, t.Interval, t.Fields, 0)
 	stored.StreamingKey = t.StreamingKey
 	stored.FieldAliases = t.FieldAliases
 	stored.SeriesName = t.SeriesName
 	stored.LabelSource = t.LabelSource
 	stored.LabelValue = t.LabelValue
-	// The wildcard pattern (if any) that enumerated this series, so Subscribe attaches it to
-	// that exact pattern's shared subscription rather than opening a per-topic one.
+	// The wildcard pattern (if any) that enumerated THIS view — it scopes coverage per-view so
+	// Subscribe rides that exact pattern's shared subscription (a concrete view, EnumeratedBy
+	// empty, always opens its own subscription instead).
 	stored.stream.enumeratedBy = t.EnumeratedBy
-	// Seed the raw buffer from an existing sibling on the same MQTT topic so a new field
-	// selection (its streaming key changes when fields change) opens with recent history
-	// instead of blanking and restarting.
-	if seed := c.siblingBuffer(t.Path); len(seed) > 0 {
-		stored.Messages = seed
-	}
+	// Point the view at the SHARED raw buffer for this MQTT topic. A new field selection (whose
+	// streaming key changes when fields change) therefore opens with the recent history that
+	// already accumulated on the shared buffer — no per-selection copy, no staleness.
+	stored.stream.raw = raw
 	c.topics.Map.Store(t.Key(), stored)
 	return stored
-}
-
-// siblingBuffer returns a copy of the largest ring buffer among already-registered
-// topics sharing the same MQTT path (base64), used to seed a newly-created topic.
-func (c *client) siblingBuffer(path string) []Message {
-	var best []Message
-	c.topics.Range(func(_, v any) bool {
-		topic, ok := v.(*Topic)
-		if !ok || topic.Path != path || topic.stream == nil {
-			return true
-		}
-		topic.stream.mu.Lock()
-		if len(topic.Messages) > len(best) {
-			best = append([]Message(nil), topic.Messages...)
-		}
-		topic.stream.mu.Unlock()
-		return true
-	})
-	return best
 }
 
 func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
@@ -706,78 +735,121 @@ func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 	if err != nil {
 		return nil, backend.DownstreamErrorf("invalid interval %s: %s", chunks[0], err)
 	}
+	// Path is ONLY the base64 topic segment (not the streaming-key suffix); it keys the shared
+	// raw layer so every view of the same MQTT topic uses one buffer + one subscription.
+	topicPath := chunks[1]
 
-	// Find an already-registered topic (usually created by QueryData via EnsureTopic),
-	// or create a default (classic, no field selection) one.
+	// Find the view (usually created by QueryData via EnsureTopic), or create a degraded classic
+	// (no field selection) one for the Live-reconnect-before-QueryData race. StreamingKey must be
+	// set from the remaining segments so the view's Key() equals reqPath (else SubscribeStream
+	// rejects the channel). Either way it points at the SHARED raw layer for this Path.
 	t, ok := c.topics.Load(reqPath)
 	if !ok {
-		// Path is ONLY the base64 topic segment (not the streaming-key suffix). Every
-		// topic subscribed to the same MQTT topic must share the same Path so that an
-		// incoming message fans out to all of them via TopicMap.AddMessage — otherwise,
-		// because paho keeps a single handler per topic filter, two panels on the same
-		// topic would starve one another.
-		//
-		// StreamingKey must also be set from the remaining segments so the topic's Key()
-		// equals reqPath and QueryData rebuilds a well-formed channel for it (otherwise
-		// SubscribeStream rejects the channel as "invalid channel path format").
-		topicPath := chunks[1]
 		t = newStreamTopic(topicPath, interval, nil, 0)
 		t.StreamingKey = strings.Join(chunks[2:], "/")
+		t.stream.raw = c.ensureRaw(topicPath, 0)
 		c.topics.Map.Store(reqPath, t)
 	}
+	raw := t.stream.raw
+	hint := t.stream.enumeratedBy // per-view: the wildcard (if any) that enumerated THIS view
 
-	// Coverage: if this series was enumerated by a wildcard panel whose subscription is active,
-	// attach to THAT pattern's shared subscription WITHOUT opening a per-topic paho subscription
-	// (it feeds this topic's buffer via dispatch). Coverage is scoped to the enumerating pattern
-	// only, so an independent concrete panel is never absorbed into some unrelated broad sub.
-	// pahoSubscribed stays false so the janitor won't paho-Unsubscribe a topic that was never
-	// individually subscribed.
-	t.stream.mu.Lock()
-	hint := t.stream.enumeratedBy
-	t.stream.mu.Unlock()
-	if hint != "" && c.attachWildcardExact(hint) {
-		t.stream.mu.Lock()
-		t.stream.attachedCount++
-		t.stream.detachedAt = time.Time{}
-		t.stream.coveredByPattern = hint
-		t.stream.mu.Unlock()
+	// Attach this consumer to the shared raw and establish its single feed. The feed is either
+	// the raw's own paho subscription or coverage by a wildcard pattern that enumerated a view
+	// (mutually exclusive; own-sub wins). N views/panels of one topic share the one feed, so
+	// reaping one view never starves the others (the feed lives while refCount > 0).
+	raw.mu.Lock()
+	raw.refCount++
+	raw.detachedAt = time.Time{}
+	ownSub := raw.pahoSubscribed
+	covered := raw.coveredByPattern
+	raw.mu.Unlock()
+
+	// Already fed by an own subscription -> every view just rides it.
+	if ownSub {
 		return t, nil
 	}
 
-	// Register this consumer and open the MQTT subscription once per topic. The
-	// subscription and buffer are kept alive across detach so zoom re-queries reseed.
-	t.stream.mu.Lock()
-	t.stream.attachedCount++
-	t.stream.detachedAt = time.Time{}
-	needSubscribe := !t.stream.pahoSubscribed
-	t.stream.pahoSubscribed = true
-	t.stream.mu.Unlock()
-	if !needSubscribe {
-		return t, nil
-	}
-
-	revert := func() {
-		t.stream.mu.Lock()
-		t.stream.pahoSubscribed = false
-		if t.stream.attachedCount > 0 {
-			t.stream.attachedCount--
+	// Concrete view (not enumerated by any wildcard): it must have its OWN subscription so a
+	// directly-typed topic is never silently absorbed into a wildcard firehose (scoped coverage).
+	// If the raw was riding a wildcard, upgrade it to an own sub and release that coverage.
+	if hint == "" {
+		raw.mu.Lock()
+		if raw.pahoSubscribed { // another consumer already opened it
+			raw.mu.Unlock()
+			return t, nil
 		}
-		t.stream.mu.Unlock()
+		release := raw.coveredByPattern
+		raw.coveredByPattern = ""
+		raw.pahoSubscribed = true
+		raw.mu.Unlock()
+		if release != "" {
+			c.detachWildcard(release)
+		}
+		return c.openOwnSub(t, raw, topicPath, logger)
 	}
 
-	topic, err := decodeTopic(t.Path, logger)
+	// Wildcard-enumerated view: ride the raw's existing wildcard coverage if any...
+	if covered != "" {
+		return t, nil
+	}
+	// ...otherwise ride the enumerating pattern's shared subscription if it is active.
+	if c.attachWildcardExact(hint) {
+		raw.mu.Lock()
+		if raw.pahoSubscribed {
+			// A concrete view opened an own sub meanwhile; it feeds the raw. Don't also hold the
+			// wildcard sub for this topic.
+			raw.mu.Unlock()
+			c.detachWildcard(hint)
+			return t, nil
+		}
+		raw.coveredByPattern = hint
+		raw.mu.Unlock()
+		return t, nil
+	}
+	// The enumerating wildcard sub isn't active (e.g. a reconnect race) -> open an own sub.
+	raw.mu.Lock()
+	if raw.pahoSubscribed {
+		raw.mu.Unlock()
+		return t, nil
+	}
+	raw.pahoSubscribed = true
+	raw.mu.Unlock()
+	return c.openOwnSub(t, raw, topicPath, logger)
+}
+
+// openOwnSub opens the one per-topic paho subscription that feeds the raw's shared buffer, with a
+// revert that undoes this consumer's attach on failure.
+func (c *client) openOwnSub(t *Topic, raw *rawTopic, topicPath string, logger log.Logger) (*Topic, error) {
+	revert := func() {
+		raw.mu.Lock()
+		raw.pahoSubscribed = false
+		if raw.refCount > 0 {
+			raw.refCount--
+		}
+		if raw.refCount == 0 {
+			raw.detachedAt = time.Now()
+		}
+		raw.mu.Unlock()
+	}
+
+	topic, err := decodeTopic(topicPath, logger)
 	if err != nil {
 		revert()
-		return nil, backend.DownstreamErrorf("error decoding MQTT topic name %s: %s", t.Path, err)
+		return nil, backend.DownstreamErrorf("error decoding MQTT topic name %s: %s", topicPath, err)
 	}
 
 	logger.Debug("Subscribing to MQTT topic", "topic", topic)
 
-	routePath := t.Path
 	if token := c.client.Subscribe(topic, 0, func(_ paho.Client, m paho.Message) {
-		// by wrapping HandleMessage we get the correct topicPath for the incoming topic
-		// and don't need to regex it against + and #.
-		c.HandleMessage(routePath, []byte(m.Payload()))
+		// A concrete subscription installs an explicit paho route, which SHADOWS the default
+		// handler (dispatch) for this exact topic — paho calls the default handler only when no
+		// route matches. So record the topic into any overlapping wildcard pattern's seen-set
+		// here too; otherwise a wildcard panel covering this topic would never enumerate it (its
+		// seen-set is normally filled by dispatch, which never fires while this route exists).
+		c.recordWildcardSeen(m.Topic())
+		// Wrapping HandleMessage gives the correct topicPath for the incoming topic without
+		// having to regex it against + and #. Always feed the shared buffer for the concrete view.
+		c.HandleMessage(topicPath, []byte(m.Payload()))
 	}); token.Wait() && token.Error() != nil {
 		revert()
 		return nil, backend.DownstreamErrorf("error subscribing to MQTT topic %s: %s", topic, token.Error())
@@ -790,26 +862,27 @@ func (c *client) Unsubscribe(reqPath string, _ log.Logger) error {
 	if !ok {
 		return nil // No error if topic doesn't exist
 	}
+	raw := t.stream.raw
+	if raw == nil {
+		return nil
+	}
 
-	// Detach this consumer but RETAIN the topic, its ring buffer, and the MQTT
-	// subscription so a re-query (e.g. a zoom, which tears down and re-establishes the
-	// stream) can reseed recent history instead of blanking. The janitor closes the
-	// subscription and frees the buffer once the topic stays detached past the grace
-	// period.
-	t.stream.mu.Lock()
-	if t.stream.attachedCount > 0 {
-		t.stream.attachedCount--
+	// Detach this consumer from the shared raw but RETAIN the buffer + subscription so a
+	// re-query (e.g. a zoom, which tears down and re-establishes the stream) reseeds recent
+	// history instead of blanking. The janitor closes the subscription and frees the buffer
+	// once the raw stays at zero consumers past the grace period.
+	raw.mu.Lock()
+	if raw.refCount > 0 {
+		raw.refCount--
 	}
-	if t.stream.attachedCount == 0 {
-		t.stream.detachedAt = time.Now()
+	var pattern string
+	if raw.refCount == 0 {
+		raw.detachedAt = time.Now()
+		// Release the covering wildcard sub's reference once the LAST consumer detaches.
+		pattern = raw.coveredByPattern
+		raw.coveredByPattern = ""
 	}
-	pattern := t.stream.coveredByPattern
-	if t.stream.attachedCount == 0 {
-		t.stream.coveredByPattern = ""
-	}
-	t.stream.mu.Unlock()
-	// Release this channel's reference on the covering wildcard sub (if any) so it can be
-	// reaped once all its covered channels are gone.
+	raw.mu.Unlock()
 	if pattern != "" {
 		c.detachWildcard(pattern)
 	}

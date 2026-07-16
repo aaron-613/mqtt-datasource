@@ -166,65 +166,6 @@ func TestStreamingKeyIntegration_ClientSubscription(t *testing.T) {
 	}
 }
 
-func TestStreamingKeyIntegration_MessageIsolation(t *testing.T) {
-	// Test that messages are properly isolated between different streaming keys
-
-	client := &mockMQTTClient{
-		topics:        make(map[string]*mqtt.Topic),
-		subscriptions: make(map[string]bool),
-	}
-
-	// Create topics with same MQTT path but different streaming keys
-	topicKey1 := "1s/dGVzdC90b3BpYw/user1/hash123/org456"
-	topicKey2 := "1s/dGVzdC90b3BpYw/user2/hash456/org456"
-
-	topic1, err := client.Subscribe(topicKey1, log.DefaultLogger)
-	if err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-	topic2, err := client.Subscribe(topicKey2, log.DefaultLogger)
-	if err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-
-	if topic1 == nil || topic2 == nil {
-		t.Fatal("Expected both topics to be created")
-	}
-
-	// Manually add messages to test isolation
-	// In real implementation, messages would be routed based on MQTT topic matching
-	topic1.Messages = append(topic1.Messages, mqtt.Message{
-		Timestamp: time.Now(),
-		Value:     []byte("message for user1"),
-	})
-
-	topic2.Messages = append(topic2.Messages, mqtt.Message{
-		Timestamp: time.Now(),
-		Value:     []byte("message for user2"),
-	})
-
-	// Verify topics maintain separate message stores
-	if len(topic1.Messages) != 1 {
-		t.Errorf("Expected 1 message in topic1, got %d", len(topic1.Messages))
-	}
-	if len(topic2.Messages) != 1 {
-		t.Errorf("Expected 1 message in topic2, got %d", len(topic2.Messages))
-	}
-
-	// Verify message content
-	if string(topic1.Messages[0].Value) != "message for user1" {
-		t.Errorf("Expected 'message for user1', got '%s'", string(topic1.Messages[0].Value))
-	}
-	if string(topic2.Messages[0].Value) != "message for user2" {
-		t.Errorf("Expected 'message for user2', got '%s'", string(topic2.Messages[0].Value))
-	}
-
-	// Verify topics are still separate instances
-	if topic1 == topic2 {
-		t.Error("Expected different topic instances for different streaming keys")
-	}
-}
-
 // Mock MQTT client for integration testing
 type mockMQTTClient struct {
 	topics        map[string]*mqtt.Topic
@@ -265,7 +206,6 @@ func (m *mockMQTTClient) Subscribe(reqPath string, logger log.Logger) (*mqtt.Top
 	topic := &mqtt.Topic{
 		Path:     "dGVzdC90b3BpYw", // This would be the full path with streaming key
 		Interval: 1 * time.Second,
-		Messages: []mqtt.Message{},
 	}
 
 	// Store with reqPath as key
@@ -287,18 +227,3 @@ func (m *mockMQTTClient) Dispose() {
 	m.subscriptions = make(map[string]bool)
 }
 
-func (m *mockMQTTClient) HandleMessage(topicPath string, payload []byte) {
-	message := mqtt.Message{
-		Timestamp: time.Now(),
-		Value:     payload,
-	}
-
-	// Find topics that match this path and add message
-	for key, topic := range m.topics {
-		if topic.Path == topicPath {
-			topic.Messages = append(topic.Messages, message)
-			// Update the stored topic
-			m.topics[key] = topic
-		}
-	}
-}

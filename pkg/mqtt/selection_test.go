@@ -141,7 +141,7 @@ func TestTopic_RingBuffer_TrimsByWindow(t *testing.T) {
 	topic.appendMessage(Message{Timestamp: base.Add(-5 * time.Second), Value: []byte("2")})
 	topic.appendMessage(Message{Timestamp: base, Value: []byte("3")})
 
-	require.Equal(t, 2, len(topic.Messages), "oldest message should be trimmed out of the window")
+	require.Equal(t, 2, topic.bufferLen(), "oldest message should be trimmed out of the window")
 }
 
 func TestTopic_SeedThenStream_NoDuplicates(t *testing.T) {
@@ -169,34 +169,54 @@ func TestTopic_SeedThenStream_NoDuplicates(t *testing.T) {
 	require.False(t, hasData)
 }
 
-func TestTopicMap_AddMessage_FansOutToSameTopic(t *testing.T) {
-	var tm TopicMap
-	// Two panels on the same MQTT topic (same Path) but different selections/keys.
-	sel := newStreamTopic("cG9sbGVy", time.Second, []string{"stats.totalTimeMs"}, time.Hour)
-	sel.StreamingKey = "uid/aaa/1"
-	classic := newStreamTopic("cG9sbGVy", time.Second, nil, time.Hour)
-	classic.StreamingKey = "uid/bbb/1"
-	tm.Store(sel)
-	tm.Store(classic)
+func TestSharedRawBuffer_TwoSelectionsOneTopic(t *testing.T) {
+	c := &client{discovered: make(map[string][]byte)}
+	// Two panels on the same MQTT topic (same Path) but different selections/keys, both
+	// registered via EnsureTopic so they share the topic's one raw buffer.
+	sel := c.EnsureTopic(&Topic{Path: "cG9sbGVy", StreamingKey: "uid/aaa/1", Interval: time.Second, Fields: []string{"stats.totalTimeMs"}})
+	classic := c.EnsureTopic(&Topic{Path: "cG9sbGVy", StreamingKey: "uid/bbb/1", Interval: time.Second})
 
-	tm.AddMessage("cG9sbGVy", Message{Timestamp: time.Now(), Value: []byte(`{"stats":{"totalTimeMs":1}}`)})
+	// A single delivery into the shared raw buffer is visible to both views (no fan-out copy).
+	c.HandleMessage("cG9sbGVy", []byte(`{"stats":{"totalTimeMs":1}}`))
 
-	require.Equal(t, 1, len(sel.Messages), "selection topic should receive the message")
-	require.Equal(t, 1, len(classic.Messages), "classic topic on the same MQTT topic should also receive it")
+	require.Equal(t, 1, sel.bufferLen(), "selection view should see the message")
+	require.Equal(t, 1, classic.bufferLen(), "classic view on the same MQTT topic should also see it")
+	require.Len(t, c.raws, 1, "exactly one shared raw buffer for the MQTT topic")
 }
 
-func TestEnsureTopic_SeedsBufferFromSibling(t *testing.T) {
+func TestEnsureTopic_NewSelectionSharesHistory(t *testing.T) {
 	c := &client{discovered: make(map[string][]byte)}
-	a := newStreamTopic("dGVzdA", time.Second, []string{"x"}, time.Hour)
-	a.StreamingKey = "uid/aaa/1"
-	a.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"x":1}`)})
-	a.appendMessage(Message{Timestamp: time.Now(), Value: []byte(`{"x":2}`)})
-	c.topics.Store(a)
+	a := c.EnsureTopic(&Topic{Path: "dGVzdA", StreamingKey: "uid/aaa/1", Interval: time.Second, Fields: []string{"x"}})
+	c.HandleMessage("dGVzdA", []byte(`{"x":1}`))
+	c.HandleMessage("dGVzdA", []byte(`{"x":2}`))
+	require.Equal(t, 2, a.bufferLen())
 
-	// Adding a 2nd field changes the streaming key -> a new topic on the same MQTT path.
+	// Adding a 2nd field changes the streaming key -> a new view on the same MQTT path. It
+	// shares the existing raw buffer, so it opens with history instead of blanking (no copy).
 	b := c.EnsureTopic(&Topic{Path: "dGVzdA", StreamingKey: "uid/bbb/1", Interval: time.Second, Fields: []string{"x", "y"}})
-	require.NotSame(t, a, b, "distinct topic instances")
-	require.Equal(t, 2, len(b.Messages), "new field selection seeds its buffer from the sibling's history")
+	require.NotSame(t, a, b, "distinct view instances")
+	require.Equal(t, 2, b.bufferLen(), "new field selection shares the topic's existing history")
+	require.Len(t, c.raws, 1, "both selections share one raw buffer")
+}
+
+func TestEnsureTopic_AddFieldReseedsWithHistoryNoBlank(t *testing.T) {
+	c := &client{discovered: make(map[string][]byte)}
+	// Panel A graphs field x; history accumulates on the shared raw buffer.
+	a := c.EnsureTopic(&Topic{Path: "dGVzdA", StreamingKey: "uid/aaa/1", Interval: time.Second, Fields: []string{"x"}})
+	c.HandleMessage("dGVzdA", []byte(`{"x":1,"y":2}`))
+	c.HandleMessage("dGVzdA", []byte(`{"x":3,"y":4}`))
+	seedA, err := a.SeedFrame(log.DefaultLogger)
+	require.NoError(t, err)
+	require.Equal(t, 2, seedA.Fields[0].Len())
+
+	// Adding field y (a new streaming key) opens a new view that immediately reseeds the shared
+	// history through its OWN framer — no blank, no restart, and no missing-number-field.
+	b := c.EnsureTopic(&Topic{Path: "dGVzdA", StreamingKey: "uid/bbb/1", Interval: time.Second, Fields: []string{"x", "y"}})
+	seedB, err := b.SeedFrame(log.DefaultLogger)
+	require.NoError(t, err)
+	require.Equal(t, 3, len(seedB.Fields), "Time + x + y")
+	require.Equal(t, 2, seedB.Fields[0].Len(), "reseeds the existing 2 rows of history")
+	require.Equal(t, "y", seedB.Fields[2].Name)
 }
 
 func TestEnsureTopic_ReconcilesFields(t *testing.T) {
@@ -224,25 +244,29 @@ func TestEnsureTopic_ReconcilesFields(t *testing.T) {
 }
 
 func TestClient_Janitor_RetainsRecentDropsStale(t *testing.T) {
-	c := &client{}
+	c := &client{raws: map[string]*rawTopic{}}
 
-	// Detached longer than the grace period, no live MQTT sub -> should be swept.
-	stale := newStreamTopic("dGVzdA", time.Second, nil, time.Hour)
-	stale.StreamingKey = "s/stale"
-	stale.stream.detachedAt = time.Now().Add(-2 * defaultGracePeriod)
-	c.topics.Store(stale)
+	// Each scenario is a distinct MQTT topic (Path) = its own shared raw. Reaping is decided on
+	// the raw (refCount + detachedAt); the raw's views are deleted with it.
+	mk := func(topic, key string, refCount int, detachedAt time.Time) *Topic {
+		path := encodeTopic(topic)
+		raw := newRawTopic(path, time.Hour)
+		raw.refCount = refCount
+		raw.detachedAt = detachedAt
+		c.raws[path] = raw
+		top := newStreamTopic(path, time.Second, nil, time.Hour)
+		top.StreamingKey = key
+		top.stream.raw = raw
+		c.topics.Store(top)
+		return top
+	}
 
-	// Detached but within grace (e.g. mid-zoom) -> must be retained.
-	fresh := newStreamTopic("dGVzdA", time.Second, nil, time.Hour)
-	fresh.StreamingKey = "s/fresh"
-	fresh.stream.detachedAt = time.Now()
-	c.topics.Store(fresh)
-
-	// Still attached (active panel) -> must be retained regardless of age.
-	attached := newStreamTopic("dGVzdA", time.Second, nil, time.Hour)
-	attached.StreamingKey = "s/attached"
-	attached.stream.attachedCount = 1
-	c.topics.Store(attached)
+	// refCount 0, detached past grace, no live sub -> swept.
+	stale := mk("stale", "s/stale", 0, time.Now().Add(-2*defaultGracePeriod))
+	// refCount 0, detached within grace (e.g. mid-zoom) -> retained.
+	fresh := mk("fresh", "s/fresh", 0, time.Now())
+	// Still attached (refCount 1) -> retained regardless of age.
+	attached := mk("attached", "s/attached", 1, time.Now().Add(-2*defaultGracePeriod))
 
 	c.sweep()
 
@@ -252,4 +276,8 @@ func TestClient_Janitor_RetainsRecentDropsStale(t *testing.T) {
 	require.False(t, staleKept, "stale detached topic should be swept")
 	require.True(t, freshKept, "recently-detached topic should be retained for zoom reseed")
 	require.True(t, attachedKept, "attached topic should never be swept")
+
+	// The stale topic's shared raw buffer is freed too.
+	_, staleRaw := c.raws[encodeTopic("stale")]
+	require.False(t, staleRaw, "stale raw buffer should be freed on reap")
 }

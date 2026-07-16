@@ -34,6 +34,7 @@ func newWildcardTestClient(fp *fakePaho) *client {
 		done:       make(chan struct{}),
 		discovered: make(map[string][]byte),
 		wildcards:  make(map[string]*wildcardSub),
+		raws:       make(map[string]*rawTopic),
 	}
 }
 
@@ -85,10 +86,7 @@ func TestWildcard_FeedsBuffersAndSeen(t *testing.T) {
 	c.deliver("a/b/c", []byte(`{"x":2}`))
 
 	require.Equal(t, []string{"a/b/c"}, c.wildcardSeen("a/+/c"))
-	top.stream.mu.Lock()
-	n := len(top.Messages)
-	top.stream.mu.Unlock()
-	require.Equal(t, 2, n, "the wildcard subscription feeds the per-series ring buffer")
+	require.Equal(t, 2, top.bufferLen(), "the wildcard subscription feeds the per-series ring buffer")
 }
 
 func TestWildcard_CoverageAttachOnly(t *testing.T) {
@@ -103,15 +101,136 @@ func TestWildcard_CoverageAttachOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, fp.subscribed, "a covered topic must NOT open its own subscription")
 
-	tp.stream.mu.Lock()
-	require.False(t, tp.stream.pahoSubscribed)
-	require.Equal(t, "a/+/c", tp.stream.coveredByPattern)
-	require.Equal(t, 1, tp.stream.attachedCount)
-	tp.stream.mu.Unlock()
+	raw := tp.stream.raw
+	raw.mu.Lock()
+	require.False(t, raw.pahoSubscribed)
+	require.Equal(t, "a/+/c", raw.coveredByPattern)
+	require.Equal(t, 1, raw.refCount)
+	raw.mu.Unlock()
 	require.Equal(t, 1, c.wildcards["a/+/c"].refCount)
 
 	require.NoError(t, c.Unsubscribe(reqPath, log.DefaultLogger))
 	require.Equal(t, 0, c.wildcards["a/+/c"].refCount, "unsubscribe releases the wildcard refcount")
+}
+
+// TestSubscribe_SharedSubRefcountAndSiblingSurvival guards the exact bug found in live testing:
+// two panels (distinct streaming keys) on the SAME concrete topic must share ONE broker
+// subscription, and detaching/reaping one must NOT tear out the subscription the other still
+// needs. Before subscription ownership moved onto the shared raw, reaping the backgrounded
+// sibling called Unsubscribe on the shared MQTT topic and starved the viewed panel.
+func TestSubscribe_SharedSubRefcountAndSiblingSurvival(t *testing.T) {
+	fp := &fakePaho{}
+	c := newWildcardTestClient(fp)
+
+	path := encodeTopic("x/y/z")
+	req1 := "1s/" + path + "/k1"
+	req2 := "1s/" + path + "/k2"
+
+	_, err := c.Subscribe(req1, log.DefaultLogger)
+	require.NoError(t, err)
+	_, err = c.Subscribe(req2, log.DefaultLogger)
+	require.NoError(t, err)
+
+	// Exactly ONE broker subscription; refCount aggregates both views.
+	require.Equal(t, []string{"x/y/z"}, fp.subscribed, "one shared broker subscription for both panels")
+	raw := c.raws[path]
+	require.NotNil(t, raw)
+	require.Equal(t, 2, raw.refCount)
+
+	// Detach one panel: the shared sub must stay open (the sibling still needs it).
+	require.NoError(t, c.Unsubscribe(req1, log.DefaultLogger))
+	require.Equal(t, 1, raw.refCount)
+	require.Empty(t, fp.unsubscribed, "detaching one panel must not unsubscribe the shared topic")
+	require.True(t, raw.pahoSubscribed, "shared subscription stays open while any view is attached")
+
+	// The surviving panel still gets data through the shared raw.
+	c.HandleMessage(path, []byte(`{"v":1}`))
+	tp2, ok := c.GetTopic(req2)
+	require.True(t, ok)
+	require.Equal(t, 1, tp2.bufferLen(), "surviving panel still fed after its sibling detached")
+
+	// Detach the last panel: refCount hits 0, now eligible for janitor reap.
+	require.NoError(t, c.Unsubscribe(req2, log.DefaultLogger))
+	require.Equal(t, 0, raw.refCount)
+	require.False(t, raw.detachedAt.IsZero(), "raw marked idle once the last consumer detaches")
+}
+
+// TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet guards the overlap bug found in live
+// testing: a concrete panel on a topic that a wildcard panel also covers. The concrete sub's
+// explicit paho route shadows the default dispatch handler for that topic, so the concrete
+// callback must itself record the topic into the overlapping wildcard's seen-set — otherwise the
+// wildcard panel never enumerates a series for it.
+func TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet(t *testing.T) {
+	fp := &fakePaho{}
+	c := newWildcardTestClient(fp)
+	// A wildcard panel is active for a/+ ...
+	c.wildcards["a/+"] = &wildcardSub{seen: map[string]struct{}{}, pahoSubscribed: true}
+
+	// ... and a concrete panel subscribes to a/b, which the wildcard also covers.
+	reqPath := "1s/" + encodeTopic("a/b") + "/k"
+	_, err := c.Subscribe(reqPath, log.DefaultLogger)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a/b"}, fp.subscribed)
+
+	// A broker message arrives on the concrete route (its explicit handler, not dispatch).
+	fp.deliverRoute("a/b", []byte(`{"v":1}`))
+
+	require.Equal(t, []string{"a/b"}, c.wildcardSeen("a/+"),
+		"a concrete subscription must record its topic into an overlapping wildcard's seen-set")
+	tp, ok := c.GetTopic(reqPath)
+	require.True(t, ok)
+	require.Equal(t, 1, tp.bufferLen(), "the shared buffer is still fed for the concrete view")
+}
+
+// TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard guards scoped coverage across the
+// shared raw: a concrete panel on a topic a wildcard also covers must open its OWN subscription
+// (never ride the wildcard firehose), regardless of attach order. A directly-typed topic stays
+// decoupled so removing the wildcard panel can't leave a firehose feeding it.
+func TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard(t *testing.T) {
+	concrete := "1s/" + encodeTopic("a/b") + "/kc"
+	wild := "1s/" + encodeTopic("a/b") + "/kw"
+
+	t.Run("concrete first", func(t *testing.T) {
+		fp := &fakePaho{}
+		c := newWildcardTestClient(fp)
+		c.wildcards["a/+"] = &wildcardSub{seen: map[string]struct{}{}, pahoSubscribed: true}
+
+		c.EnsureTopic(&Topic{Path: encodeTopic("a/b"), Interval: time.Second, StreamingKey: "kc"})
+		_, err := c.Subscribe(concrete, log.DefaultLogger)
+		require.NoError(t, err)
+		c.EnsureTopic(&Topic{Path: encodeTopic("a/b"), Interval: time.Second, StreamingKey: "kw", EnumeratedBy: "a/+"})
+		_, err = c.Subscribe(wild, log.DefaultLogger)
+		require.NoError(t, err)
+
+		raw := c.raws[encodeTopic("a/b")]
+		require.True(t, raw.pahoSubscribed, "concrete panel opens its own subscription")
+		require.Equal(t, "", raw.coveredByPattern, "not riding the wildcard")
+		require.Equal(t, []string{"a/b"}, fp.subscribed)
+		require.Equal(t, 0, c.wildcards["a/+"].refCount, "wildcard sub not held by the concrete topic")
+	})
+
+	t.Run("wildcard first, concrete upgrades", func(t *testing.T) {
+		fp := &fakePaho{}
+		c := newWildcardTestClient(fp)
+		c.wildcards["a/+"] = &wildcardSub{seen: map[string]struct{}{}, pahoSubscribed: true}
+
+		c.EnsureTopic(&Topic{Path: encodeTopic("a/b"), Interval: time.Second, StreamingKey: "kw", EnumeratedBy: "a/+"})
+		_, err := c.Subscribe(wild, log.DefaultLogger)
+		require.NoError(t, err)
+		raw := c.raws[encodeTopic("a/b")]
+		require.Equal(t, "a/+", raw.coveredByPattern, "initially rides the wildcard")
+		require.Equal(t, 1, c.wildcards["a/+"].refCount)
+
+		// The concrete panel arrives -> upgrade to an own sub and release the coverage.
+		c.EnsureTopic(&Topic{Path: encodeTopic("a/b"), Interval: time.Second, StreamingKey: "kc"})
+		_, err = c.Subscribe(concrete, log.DefaultLogger)
+		require.NoError(t, err)
+
+		require.True(t, raw.pahoSubscribed, "upgraded to its own subscription")
+		require.Equal(t, "", raw.coveredByPattern, "coverage released on upgrade")
+		require.Equal(t, []string{"a/b"}, fp.subscribed)
+		require.Equal(t, 0, c.wildcards["a/+"].refCount, "wildcard sub no longer held by this topic (no firehose coupling)")
+	})
 }
 
 func TestWildcard_ClassicUncoveredOpensOwnSub(t *testing.T) {
@@ -137,10 +256,11 @@ func TestWildcard_UnrelatedConcreteNotAbsorbed(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"a/b/c"}, fp.subscribed, "independent concrete panel opens its own sub despite a covering wildcard")
-	tp.stream.mu.Lock()
-	require.Equal(t, "", tp.stream.coveredByPattern)
-	require.True(t, tp.stream.pahoSubscribed)
-	tp.stream.mu.Unlock()
+	raw := tp.stream.raw
+	raw.mu.Lock()
+	require.Equal(t, "", raw.coveredByPattern)
+	require.True(t, raw.pahoSubscribed)
+	raw.mu.Unlock()
 	require.Equal(t, 0, c.wildcards["a/#"].refCount, "the broad wildcard sub is untouched by the concrete panel")
 }
 
@@ -188,10 +308,7 @@ func TestWildcard_OverlappingPatternsNoDoubleAppend(t *testing.T) {
 	// patterns -> the buffer is appended exactly once.
 	c.deliver("a/b/c", []byte(`{"x":1}`))
 
-	top.stream.mu.Lock()
-	n := len(top.Messages)
-	top.stream.mu.Unlock()
-	require.Equal(t, 1, n, "no double-append across overlapping patterns")
+	require.Equal(t, 1, top.bufferLen(), "no double-append across overlapping patterns")
 	require.Equal(t, []string{"a/b/c"}, c.wildcardSeen("a/+/c"))
 	require.Equal(t, []string{"a/b/c"}, c.wildcardSeen("a/b/#"))
 }
@@ -206,12 +323,12 @@ func TestWildcard_SharedPatternFansOutToBothPanels(t *testing.T) {
 
 	c.deliver("a/b/c", []byte(`{"x":1}`))
 
+	// Both panels (views) on the same concrete topic share one raw buffer, so a single
+	// delivery is visible to each without any per-panel copy.
 	for _, tp := range []*Topic{t1, t2} {
-		tp.stream.mu.Lock()
-		n := len(tp.Messages)
-		tp.stream.mu.Unlock()
-		require.Equal(t, 1, n, "one message fans out once to each panel's buffer")
+		require.Equal(t, 1, tp.bufferLen(), "one message is visible to each panel's view via the shared buffer")
 	}
+	require.Len(t, c.raws, 1, "both panels share a single raw buffer for the topic")
 }
 
 // Identical filter string used by BOTH discovery and a wildcard panel: the broker keeps one

@@ -27,11 +27,26 @@ type fakePaho struct {
 	paho.Client
 	subscribed   []string
 	unsubscribed []string
+	routes       map[string]paho.MessageHandler // explicit callbacks by exact topic (nil = default handler)
 }
 
-func (f *fakePaho) Subscribe(topic string, _ byte, _ paho.MessageHandler) paho.Token {
+func (f *fakePaho) Subscribe(topic string, _ byte, cb paho.MessageHandler) paho.Token {
 	f.subscribed = append(f.subscribed, topic)
+	if cb != nil {
+		if f.routes == nil {
+			f.routes = map[string]paho.MessageHandler{}
+		}
+		f.routes[topic] = cb
+	}
 	return completedToken{}
+}
+
+// deliverRoute invokes the explicit callback registered for an exact topic — mirroring paho
+// routing a message to a concrete subscription's own handler (which shadows the default handler).
+func (f *fakePaho) deliverRoute(topic string, payload []byte) {
+	if cb := f.routes[topic]; cb != nil {
+		cb(nil, fakeMessage{topic: topic, payload: payload})
+	}
 }
 
 func (f *fakePaho) Unsubscribe(topics ...string) paho.Token {

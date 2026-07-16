@@ -54,9 +54,10 @@ func TestLive_Diagnostic(t *testing.T) {
 	time.Sleep(8 * time.Second)
 
 	got, ok := c.GetTopic(key)
-	t.Logf("topic found=%v buffer_len=%d", ok, len(got.Messages))
-	if len(got.Messages) > 0 {
-		t.Logf("  sample raw payload: %s", string(got.Messages[len(got.Messages)-1].Value))
+	buf := got.stream.raw.snapshot()
+	t.Logf("topic found=%v buffer_len=%d", ok, len(buf))
+	if len(buf) > 0 {
+		t.Logf("  sample raw payload: %s", string(buf[len(buf)-1].Value))
 	}
 
 	frame, hasData, err := got.StreamDelta(log.DefaultLogger)

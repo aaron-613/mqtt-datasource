@@ -40,11 +40,7 @@ func (m *mockClient) Subscribe(reqPath string, logger log.Logger) (*Topic, error
 	}
 
 	topicPath := path.Join(chunks[1:]...)
-	t := &Topic{
-		Path:     topicPath,
-		Interval: interval,
-		Messages: []Message{},
-	}
+	t := newStreamTopic(topicPath, interval, nil, 0)
 
 	// Track MQTT subscription (simplified for testing)
 	if m.subscriptions == nil {
@@ -74,7 +70,13 @@ func (m *mockClient) HandleMessage(topicPath string, payload []byte) {
 		Timestamp: time.Now(),
 		Value:     payload,
 	}
-	m.topics.AddMessage(topicPath, message)
+	// Self-contained mock fan-out by Path (the real client routes into the shared raw layer).
+	m.topics.Range(func(_, v any) bool {
+		if tp, ok := v.(*Topic); ok && tp.Path == topicPath {
+			tp.appendMessage(message)
+		}
+		return true
+	})
 }
 
 func newMockClient() *mockClient {
@@ -302,10 +304,10 @@ func TestClient_MessageHandling_WithStreamingKeys(t *testing.T) {
 	updatedTopic1, _ := c.GetTopic(reqPath1)
 	updatedTopic2, _ := c.GetTopic(reqPath2)
 
-	if len(updatedTopic1.Messages) != 1 {
-		t.Errorf("Expected 1 message in topic1, got %d", len(updatedTopic1.Messages))
+	if got := updatedTopic1.bufferLen(); got != 1 {
+		t.Errorf("Expected 1 message in topic1, got %d", got)
 	}
-	if len(updatedTopic2.Messages) != 0 {
-		t.Errorf("Expected 0 messages in topic2, got %d", len(updatedTopic2.Messages))
+	if got := updatedTopic2.bufferLen(); got != 0 {
+		t.Errorf("Expected 0 messages in topic2, got %d", got)
 	}
 }

@@ -38,54 +38,128 @@ type Topic struct {
 	SeriesName   string            `json:"-"`                      // wildcard-matched segment(s); the topic-source default when LabelValue is empty
 	EnumeratedBy string            `json:"-"`                      // wildcard pattern that enumerated this series (scopes coverage); empty for classic queries
 	Interval     time.Duration     `json:"-"`
-	Window       time.Duration `json:"-"` // ring buffer retention window
-	Messages     []Message     `json:"-"` // retained ring buffer (also the source for streamed deltas)
 
-	// stream holds concurrency/buffering state. It is a pointer so Topic stays
-	// copyable (some tests copy Topic by value); it is created for topics the
-	// client manages for streaming.
+	// stream holds concurrency/framing state (the VIEW layer). It is a pointer so Topic
+	// stays copyable (some tests copy Topic by value); it is created for topics the
+	// client manages for streaming. The raw ring buffer + MQTT subscription live in the
+	// shared rawTopic (the RAW layer) that stream.raw points to — one per MQTT topic,
+	// shared across every field-selection/query of that topic.
 	stream *streamState
 }
 
-type streamState struct {
-	mu             sync.Mutex
-	framer         *framer
-	watermark      time.Time // timestamp of the last message emitted to the live stream
-	pahoSubscribed bool      // whether an MQTT subscription is currently open for this topic
-	attachedCount  int       // number of active RunStream consumers
-	detachedAt     time.Time // when attachedCount last dropped to 0 (for janitor cleanup)
-	// enumeratedBy is the wildcard pattern (if any) whose queryWildcard produced this series;
-	// it scopes coverage so the series attaches only to that pattern's shared subscription.
-	// coveredByPattern is set (to that filter) once the series is actually attached to the
-	// shared wildcard subscription instead of its own per-topic subscription; empty for classic
-	// single-topic subscriptions. Used to release the wildcard sub's refcount on detach.
-	enumeratedBy     string
+// rawTopic is the shared RAW layer, keyed by Path (base64 topic) alone. It owns the single
+// ring buffer for that MQTT topic, shared across all field-selections/queries (views). Each
+// view frames this buffer through its own framer + watermark. (Subscription ownership and
+// refcounting move onto rawTopic in the follow-up commit; for now the per-view streamState
+// still owns the paho subscription.)
+type rawTopic struct {
+	mu       sync.Mutex
+	path     string        // base64 topic == Topic.Path; the raws-map key
+	window   time.Duration // ring-buffer retention window
+	messages []Message     // THE shared ring buffer (also the source for streamed deltas)
+
+	// Subscription ownership — one MQTT feed per topic, shared by every view. pahoSubscribed:
+	// an own per-topic paho subscription is open. coveredByPattern: non-empty means this topic
+	// is fed by a wildcard subscription (that exact pattern) instead of its own sub. The two are
+	// mutually exclusive as the raw's active feed; an own sub takes precedence (a concrete view
+	// upgrades a covered raw to its own sub — see Subscribe).
+	pahoSubscribed   bool
 	coveredByPattern string
+
+	// refCount is the number of active RunStream consumers (across all views/field-selections
+	// of this topic). detachedAt is when it last dropped to 0, for janitor reaping past grace.
+	refCount   int
+	detachedAt time.Time
 }
 
-// newStreamTopic builds a Topic with buffering/streaming state initialized.
-func newStreamTopic(topicPath string, interval time.Duration, fields []string, window time.Duration) *Topic {
+func newRawTopic(path string, window time.Duration) *rawTopic {
 	if window <= 0 {
 		window = defaultWindow
 	}
+	return &rawTopic{path: path, window: window}
+}
+
+// append adds a message to the shared ring buffer and trims by window and cap.
+func (r *rawTopic) append(m Message) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.messages = append(r.messages, m)
+	r.trimLocked(m.Timestamp)
+}
+
+func (r *rawTopic) trimLocked(now time.Time) {
+	if r.window > 0 {
+		cutoff := now.Add(-r.window)
+		drop := 0
+		for drop < len(r.messages) && r.messages[drop].Timestamp.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			r.messages = append(r.messages[:0], r.messages[drop:]...)
+		}
+	}
+	if len(r.messages) > maxBufferedMessages {
+		r.messages = append(r.messages[:0], r.messages[len(r.messages)-maxBufferedMessages:]...)
+	}
+}
+
+// snapshot returns a copy of the entire buffer (for seeding).
+func (r *rawTopic) snapshot() []Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Message, len(r.messages))
+	copy(out, r.messages)
+	return out
+}
+
+// since returns a copy of the messages newer than watermark (for streaming deltas).
+func (r *rawTopic) since(watermark time.Time) []Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var delta []Message
+	for _, m := range r.messages {
+		if m.Timestamp.After(watermark) {
+			delta = append(delta, m)
+		}
+	}
+	return delta
+}
+
+// streamState is the per-query VIEW layer: a framer over the shared raw buffer, plus this
+// view's own watermark. Subscription/refcount/coverage all live on the shared rawTopic now.
+type streamState struct {
+	mu        sync.Mutex
+	framer    *framer
+	watermark time.Time // timestamp of the last message emitted to THIS view's stream
+	raw       *rawTopic // shared raw layer (buffer + subscription) for this view's Path
+	// enumeratedBy is the wildcard pattern (if any) whose queryWildcard produced THIS view;
+	// empty for a directly-typed concrete query. It scopes coverage per-view: a view rides a
+	// wildcard subscription only if that exact pattern enumerated it (a concrete view always
+	// opens its own subscription and is never absorbed into a wildcard firehose).
+	enumeratedBy string
+}
+
+// newStreamTopic builds a Topic with view + a private raw layer initialized. Callers that
+// want the SHARED raw for a Path (EnsureTopic) overwrite stream.raw afterwards; the private
+// raw here serves standalone Topics (the RunStream fallback and tests).
+func newStreamTopic(topicPath string, interval time.Duration, fields []string, window time.Duration) *Topic {
 	return &Topic{
 		Path:     topicPath,
 		Interval: interval,
 		Fields:   fields,
-		Window:   window,
-		stream:   &streamState{framer: newFramer(fields...)},
+		stream:   &streamState{framer: newFramer(fields...), raw: newRawTopic(topicPath, window)},
 	}
 }
 
-// ensureStream lazily initializes stream state for Topics created as literals
+// ensureStream lazily initializes view + raw state for Topics created as literals
 // (e.g. in tests). Client-managed topics are always built via newStreamTopic so
 // this is a no-op for them.
 func (t *Topic) ensureStream() {
 	if t.stream == nil {
-		if t.Window <= 0 {
-			t.Window = defaultWindow
-		}
 		t.stream = &streamState{framer: newFramer(t.Fields...)}
+	}
+	if t.stream.raw == nil {
+		t.stream.raw = newRawTopic(t.Path, 0)
 	}
 }
 
@@ -130,29 +204,18 @@ func (t *Topic) Key() string {
 	return path.Join(t.Interval.String(), t.Path, t.StreamingKey)
 }
 
-// appendMessage adds a message to the ring buffer and trims by window and cap.
+// appendMessage adds a message to the shared raw ring buffer.
 func (t *Topic) appendMessage(m Message) {
 	t.ensureStream()
-	t.stream.mu.Lock()
-	defer t.stream.mu.Unlock()
-	t.Messages = append(t.Messages, m)
-	t.trimLocked(m.Timestamp)
+	t.stream.raw.append(m)
 }
 
-func (t *Topic) trimLocked(now time.Time) {
-	if t.Window > 0 {
-		cutoff := now.Add(-t.Window)
-		drop := 0
-		for drop < len(t.Messages) && t.Messages[drop].Timestamp.Before(cutoff) {
-			drop++
-		}
-		if drop > 0 {
-			t.Messages = append(t.Messages[:0], t.Messages[drop:]...)
-		}
-	}
-	if len(t.Messages) > maxBufferedMessages {
-		t.Messages = append(t.Messages[:0], t.Messages[len(t.Messages)-maxBufferedMessages:]...)
-	}
+// bufferLen returns the number of messages currently in the shared raw buffer.
+func (t *Topic) bufferLen() int {
+	t.ensureStream()
+	t.stream.raw.mu.Lock()
+	defer t.stream.raw.mu.Unlock()
+	return len(t.stream.raw.messages)
 }
 
 // SeedFrame frames the entire retained buffer, for QueryData to seed a panel with
@@ -160,11 +223,12 @@ func (t *Topic) trimLocked(now time.Time) {
 // seeded message so the subsequent live stream does not re-send seeded rows.
 func (t *Topic) SeedFrame(logger log.Logger) (*data.Frame, error) {
 	t.ensureStream()
+	// Snapshot the shared raw buffer first (releasing raw.mu), then take the view lock for
+	// framer + watermark. The two locks are never held simultaneously.
+	msgs := t.stream.raw.snapshot()
 	t.stream.mu.Lock()
 	defer t.stream.mu.Unlock()
 
-	msgs := make([]Message, len(t.Messages))
-	copy(msgs, t.Messages)
 	if len(msgs) > 0 {
 		t.stream.watermark = msgs[len(msgs)-1].Timestamp
 	}
@@ -178,17 +242,17 @@ func (t *Topic) SeedFrame(logger log.Logger) (*data.Frame, error) {
 func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
 	t.ensureStream()
 	t.stream.mu.Lock()
-	defer t.stream.mu.Unlock()
+	wm := t.stream.watermark
+	t.stream.mu.Unlock()
 
-	var delta []Message
-	for _, m := range t.Messages {
-		if m.Timestamp.After(t.stream.watermark) {
-			delta = append(delta, m)
-		}
-	}
+	// Read the delta from the shared raw buffer without holding the view lock.
+	delta := t.stream.raw.since(wm)
 	if len(delta) == 0 {
 		return nil, false, nil
 	}
+
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
 	t.stream.watermark = delta[len(delta)-1].Timestamp
 	frame, err := t.stream.framer.toFrame(delta, logger)
 	t.applyLabels(frame, delta)
@@ -346,41 +410,6 @@ func (tm *TopicMap) Load(key string) (*Topic, bool) {
 	return topic, ok
 }
 
-// AddMessage adds a message to every topic whose MQTT path matches.
-func (tm *TopicMap) AddMessage(path string, message Message) {
-	tm.Range(func(key, t any) bool {
-		topic, ok := t.(*Topic)
-		if !ok {
-			return false
-		}
-		if topic.Path == path {
-			topic.appendMessage(message)
-		}
-		return true
-	})
-}
-
-// HasSubscription returns true if the topic map has a subscription for the given path.
-func (tm *TopicMap) HasSubscription(path string) bool {
-	found := false
-
-	tm.Range(func(key, t any) bool {
-		topic, ok := t.(*Topic)
-		if !ok {
-			return true // this shouldn't happen, but continue iterating
-		}
-
-		if topic.Path == path {
-			found = true
-			return false // topic found, stop iterating
-		}
-
-		return true // continue iterating
-	})
-
-	return found
-}
-
 // Store stores the topic in the map.
 func (tm *TopicMap) Store(t *Topic) {
 	tm.Map.Store(t.Key(), t)
@@ -413,7 +442,7 @@ func decodeTopic(topicPath string, logger log.Logger) (string, error) {
 }
 
 // encodeTopic is the inverse of decodeTopic for a single topic name: URL-safe base64, matching
-// the frontend's channel encoding and the Topic.Path key used by TopicMap.AddMessage.
+// the frontend's channel encoding and the Topic.Path key used to route into the raw layer.
 func encodeTopic(topic string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(topic))
 }

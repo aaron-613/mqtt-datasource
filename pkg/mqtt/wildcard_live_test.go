@@ -49,14 +49,13 @@ func TestLive_WildcardLifecycle(t *testing.T) {
 	reqPath := "1s/" + encodeTopic(seen[0]) + "/k"
 	top, err := c.Subscribe(reqPath, log.DefaultLogger)
 	require.NoError(t, err)
-	top.stream.mu.Lock()
-	covered := top.stream.coveredByPattern
-	top.stream.mu.Unlock()
+	raw := top.stream.raw
+	raw.mu.Lock()
+	covered := raw.coveredByPattern
+	raw.mu.Unlock()
 	require.Equal(t, pattern, covered, "concrete topic is covered by the wildcard sub, not its own")
 
 	require.Eventually(t, func() bool {
-		top.stream.mu.Lock()
-		defer top.stream.mu.Unlock()
-		return len(top.Messages) > 0
+		return top.bufferLen() > 0
 	}, 5*time.Second, 100*time.Millisecond, "wildcard subscription should feed the per-series buffer")
 }

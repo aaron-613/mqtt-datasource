@@ -139,42 +139,37 @@ func TestTopicMap_Store_And_Load_WithStreamingKey(t *testing.T) {
 	}
 }
 
-func TestTopicMap_AddMessage_WithStreamingKey(t *testing.T) {
+func TestSharedRawBuffer_TwoViewsOneTopic_WithStreamingKey(t *testing.T) {
 	tm := &TopicMap{}
 
+	// Two views (distinct streaming keys) on the SAME MQTT topic share one raw buffer.
+	raw := newRawTopic("sensor/temp", 0)
 	topic1 := &Topic{
 		Path:         "sensor/temp",
 		Interval:     1 * time.Second,
 		StreamingKey: "user1/hash123/org456",
-		Messages:     []Message{},
+		stream:       &streamState{framer: newFramer(), raw: raw},
 	}
-
 	topic2 := &Topic{
-		Path:         "sensor/temp", // Same MQTT path
+		Path:         "sensor/temp",          // Same MQTT path
 		Interval:     1 * time.Second,
 		StreamingKey: "user2/hash456/org456", // Different streaming key
-		Messages:     []Message{},
+		stream:       &streamState{framer: newFramer(), raw: raw},
 	}
 
 	tm.Store(topic1)
 	tm.Store(topic2)
 
-	// Add message - should go to both topics since they have the same MQTT path
-	message := Message{
-		Timestamp: time.Now(),
-		Value:     []byte("test message"),
-	}
+	// A single append to the shared raw buffer is visible to both views (no fan-out copy).
+	raw.append(Message{Timestamp: time.Now(), Value: []byte("test message")})
 
-	tm.AddMessage("sensor/temp", message)
-
-	// Check that both topics received the message
 	updatedTopic1, _ := tm.Load(topic1.Key())
 	updatedTopic2, _ := tm.Load(topic2.Key())
 
-	if len(updatedTopic1.Messages) != 1 {
-		t.Errorf("Expected 1 message in topic1, got %d", len(updatedTopic1.Messages))
+	if got := updatedTopic1.bufferLen(); got != 1 {
+		t.Errorf("Expected 1 message visible to topic1, got %d", got)
 	}
-	if len(updatedTopic2.Messages) != 1 {
-		t.Errorf("Expected 1 message in topic2, got %d", len(updatedTopic2.Messages))
+	if got := updatedTopic2.bufferLen(); got != 1 {
+		t.Errorf("Expected 1 message visible to topic2, got %d", got)
 	}
 }
