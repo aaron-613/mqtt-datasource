@@ -21,9 +21,8 @@ func wildcardQuery(topic, filter string) backend.DataQuery {
 func TestQueryWildcard_EnumeratesFromEnsureWildcard(t *testing.T) {
 	newDS := func(seen []string) *MQTTDatasource {
 		mc := &mockMQTTClient{
-			topics:        map[string]*mqtt.Topic{},
-			subscriptions: map[string]bool{},
-			wildcardSeen:  seen,
+			topics:       map[string]*mqtt.Topic{},
+			wildcardSeen: seen,
 		}
 		return NewMQTTDatasource(mc, "uid")
 	}

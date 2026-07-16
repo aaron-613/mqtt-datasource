@@ -17,7 +17,7 @@ func restrictQueryFor(topic string) backend.DataQuery {
 }
 
 func newRestrictDS(restrict bool, roots []string) (*MQTTDatasource, *mockMQTTClient) {
-	mc := &mockMQTTClient{topics: map[string]*mqtt.Topic{}, subscriptions: map[string]bool{}}
+	mc := &mockMQTTClient{topics: map[string]*mqtt.Topic{}}
 	ds := NewMQTTDatasource(mc, "uid")
 	ds.restrictTopics = restrict
 	ds.roots = roots

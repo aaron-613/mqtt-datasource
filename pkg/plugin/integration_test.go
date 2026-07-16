@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,8 +56,7 @@ func TestStreamingKeyIntegration_TopicUniqueness(t *testing.T) {
 	ds := &MQTTDatasource{
 		channelPrefix: "ds/test-uid",
 		Client: &mockMQTTClient{
-			topics:        make(map[string]*mqtt.Topic),
-			subscriptions: make(map[string]bool),
+			topics: make(map[string]*mqtt.Topic),
 		},
 	}
 
@@ -109,68 +109,12 @@ func TestStreamingKeyIntegration_TopicUniqueness(t *testing.T) {
 	}
 }
 
-func TestStreamingKeyIntegration_ClientSubscription(t *testing.T) {
-	// Test that client subscription works correctly with streaming keys
-
-	// Create mock client
-	client := &mockMQTTClient{
-		topics:        make(map[string]*mqtt.Topic),
-		subscriptions: make(map[string]bool),
-	}
-
-	// Topic keys that would come from the streaming system
-	topicKey1 := "1s/dGVzdC90b3BpYw/user1/hash123/org456"
-	topicKey2 := "1s/dGVzdC90b3BpYw/user2/hash456/org456"
-	topicKey3 := "1s/dGVzdC90b3BpYw/user1/hash123/org789"
-
-	// Subscribe to all three
-	topic1, err := client.Subscribe(topicKey1, log.DefaultLogger)
-	if err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-	topic2, err := client.Subscribe(topicKey2, log.DefaultLogger)
-	if err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-	topic3, err := client.Subscribe(topicKey3, log.DefaultLogger)
-	if err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-
-	// Verify all topics were created
-	if topic1 == nil || topic2 == nil || topic3 == nil {
-		t.Fatal("Expected all topics to be created")
-	}
-
-	// Verify they are different instances
-	if topic1 == topic2 || topic1 == topic3 || topic2 == topic3 {
-		t.Error("Expected different topic instances for different streaming keys")
-	}
-
-	// Verify each can be retrieved independently
-	retrieved1, found1 := client.GetTopic(topicKey1)
-	retrieved2, found2 := client.GetTopic(topicKey2)
-	retrieved3, found3 := client.GetTopic(topicKey3)
-
-	if !found1 || !found2 || !found3 {
-		t.Error("Expected all topics to be retrievable")
-	}
-
-	if retrieved1 != topic1 || retrieved2 != topic2 || retrieved3 != topic3 {
-		t.Error("Expected retrieved topics to match original instances")
-	}
-
-	// Verify MQTT subscription was made (should be the same for all since same MQTT topic)
-	if !client.subscriptions["test/topic"] {
-		t.Error("Expected MQTT subscription to be made")
-	}
-}
-
-// Mock MQTT client for integration testing
+// Mock MQTT client for plugin-layer tests (query.go channel building, wildcard enumeration,
+// restrict guardrail). A stub for the mqtt.Client interface — the REAL client's Subscribe/raw/view
+// behavior is covered in pkg/mqtt (client_test.go + harness_test.go), not here.
 type mockMQTTClient struct {
-	topics        map[string]*mqtt.Topic
-	subscriptions map[string]bool
-	wildcardSeen  []string // concrete topics EnsureWildcard should return
+	topics       map[string]*mqtt.Topic
+	wildcardSeen []string // concrete topics EnsureWildcard should return
 }
 
 func (m *mockMQTTClient) GetTopic(reqPath string) (*mqtt.Topic, bool) {
@@ -195,35 +139,26 @@ func (m *mockMQTTClient) IsConnected() bool {
 	return true
 }
 
-func (m *mockMQTTClient) Subscribe(reqPath string, logger log.Logger) (*mqtt.Topic, error) {
-	// Check if already exists
+func (m *mockMQTTClient) Subscribe(reqPath string, _ log.Logger) (*mqtt.Topic, error) {
 	if topic, exists := m.topics[reqPath]; exists {
 		return topic, nil
 	}
-
-	// Parse the reqPath (simplified version)
-	// For testing, assume the encoded topic is "dGVzdC90b3BpYw" which decodes to "test/topic"
-	topic := &mqtt.Topic{
-		Path:     "dGVzdC90b3BpYw", // This would be the full path with streaming key
-		Interval: 1 * time.Second,
+	// Parse reqPath the way the real client does: interval / base64-topic / streaming-key...
+	chunks := strings.Split(reqPath, "/")
+	if len(chunks) < 2 {
+		return nil, nil
 	}
-
-	// Store with reqPath as key
+	topic := &mqtt.Topic{Path: chunks[1], StreamingKey: strings.Join(chunks[2:], "/"), Interval: time.Second}
 	m.topics[reqPath] = topic
-
-	// Simulate MQTT subscription (would normally decode the topic)
-	m.subscriptions["test/topic"] = true
-
 	return topic, nil
 }
 
-func (m *mockMQTTClient) Unsubscribe(reqPath string, logger log.Logger) error {
+func (m *mockMQTTClient) Unsubscribe(reqPath string, _ log.Logger) error {
 	delete(m.topics, reqPath)
 	return nil
 }
 
 func (m *mockMQTTClient) Dispose() {
 	m.topics = make(map[string]*mqtt.Topic)
-	m.subscriptions = make(map[string]bool)
 }
 
