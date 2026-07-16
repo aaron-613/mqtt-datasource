@@ -126,6 +126,11 @@ type client struct {
 	// guarded by wildMu.
 	wildMu    sync.RWMutex
 	wildcards map[string]*wildcardSub
+
+	// sweepAfterScan, if set, is called by sweep() between phase 1 (selecting idle victims) and
+	// phase 2 (the guarded delete). Test-only hook for deterministically exercising the
+	// reap-vs-reattach re-check; nil in production.
+	sweepAfterScan func()
 }
 
 // wildcardSub tracks one active wildcard subscription: the concrete topics it has observed
@@ -607,41 +612,54 @@ func (c *client) sweep() {
 	}
 	c.rawMu.RUnlock()
 
+	if c.sweepAfterScan != nil {
+		c.sweepAfterScan()
+	}
+
 	for _, vv := range victims {
-		c.rawMu.RLock()
+		// Re-check refCount and delete from the map in ONE critical section under rawMu + r.mu,
+		// the same locks ensureRawAttached takes to attach. This closes the TOCTOU where a
+		// Subscribe re-attaches between the re-check and the delete: either the attach's
+		// refCount++ is seen here (refCount>0 -> spared) or it happens after the delete (against a
+		// freshly-created raw, since this one is gone from the map). No IO under the locks.
+		c.rawMu.Lock()
 		r := c.raws[vv.path]
-		c.rawMu.RUnlock()
 		if r == nil {
+			c.rawMu.Unlock()
 			continue
 		}
-		// Re-check under the raw lock so a topic that re-attached since the scan is spared.
 		r.mu.Lock()
 		stillStale := r.refCount == 0 && !r.detachedAt.IsZero() && time.Since(r.detachedAt) > c.grace()
 		if stillStale {
 			r.pahoSubscribed = false
+			delete(c.raws, vv.path)
 		}
 		r.mu.Unlock()
+		c.rawMu.Unlock()
 		if !stillStale {
 			continue
 		}
-		c.rawMu.Lock()
-		delete(c.raws, vv.path)
-		c.rawMu.Unlock()
 		if vv.hadSub {
 			c.client.Unsubscribe(vv.mqtt)
 		}
-		// Drop every view of this topic — they are idle (no active consumer holds the raw).
-		c.deleteViewsForPath(vv.path)
+		// Drop the reaped raw's views. Only those still pointing at THIS raw — a view that a
+		// concurrent Subscribe already re-pointed to a fresh raw for the same path is live.
+		c.deleteReapedViews(vv.path, r)
 		log.DefaultLogger.Debug("janitor removed idle topic", "path", vv.path)
 	}
 }
 
-// deleteViewsForPath removes all views (by Key) whose MQTT Path matches, when their shared raw
-// is reaped.
-func (c *client) deleteViewsForPath(path string) {
+// deleteReapedViews removes views (by Key) whose MQTT Path matches AND whose shared raw is the
+// one just reaped. A view re-pointed to a newer raw for the same path (by a racing Subscribe) is
+// left intact.
+func (c *client) deleteReapedViews(path string, reaped *rawTopic) {
 	var keys []string
 	c.topics.Range(func(k, v any) bool {
-		if t, ok := v.(*Topic); ok && t.Path == path {
+		t, ok := v.(*Topic)
+		if !ok || t.Path != path {
+			return true
+		}
+		if t.currentRaw() == reaped {
 			keys = append(keys, k.(string))
 		}
 		return true
@@ -687,6 +705,36 @@ func (c *client) HandleMessage(topic string, payload []byte) {
 	}
 }
 
+// ensureRawAttached gets (or creates) the shared raw for a Path and atomically increments its
+// refcount, all under rawMu. This cannot race the janitor's reap, which re-checks refCount==0 and
+// deletes under the SAME rawMu (+ raw.mu) — so a consumer re-attaching at grace expiry is always
+// seen and spared, and a reaped raw is never handed out (a fresh one is created instead). It
+// re-points the view at the returned live raw (which may differ from a cached, since-reaped one)
+// and returns a snapshot of the raw's feed state.
+func (c *client) ensureRawAttached(t *Topic, path string) (raw *rawTopic, ownSub bool, covered string) {
+	c.rawMu.Lock()
+	if c.raws == nil {
+		c.raws = make(map[string]*rawTopic)
+	}
+	raw = c.raws[path]
+	if raw == nil {
+		raw = newRawTopic(path, 0)
+		c.raws[path] = raw
+	}
+	raw.mu.Lock()
+	raw.refCount++
+	raw.detachedAt = time.Time{}
+	ownSub = raw.pahoSubscribed
+	covered = raw.coveredByPattern
+	raw.mu.Unlock()
+	c.rawMu.Unlock()
+
+	t.stream.mu.Lock()
+	t.stream.raw = raw
+	t.stream.mu.Unlock()
+	return raw, ownSub, covered
+}
+
 func (c *client) GetTopic(reqPath string) (*Topic, bool) {
 	return c.topics.Load(reqPath)
 }
@@ -705,6 +753,9 @@ func (c *client) EnsureTopic(t *Topic) *Topic {
 		existing.reconcileFields(t.Fields, t.FieldAliases, t.SeriesName, t.LabelSource, t.LabelValue)
 		existing.stream.mu.Lock()
 		existing.stream.enumeratedBy = t.EnumeratedBy
+		// Re-point at the live raw in case the cached one was reaped while idle, so SeedFrame
+		// frames the current buffer rather than an orphaned one.
+		existing.stream.raw = raw
 		existing.stream.mu.Unlock()
 		return existing
 	}
@@ -750,19 +801,16 @@ func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 		t.stream.raw = c.ensureRaw(topicPath, 0)
 		c.topics.Map.Store(reqPath, t)
 	}
-	raw := t.stream.raw
+	t.stream.mu.Lock()
 	hint := t.stream.enumeratedBy // per-view: the wildcard (if any) that enumerated THIS view
+	t.stream.mu.Unlock()
 
-	// Attach this consumer to the shared raw and establish its single feed. The feed is either
-	// the raw's own paho subscription or coverage by a wildcard pattern that enumerated a view
-	// (mutually exclusive; own-sub wins). N views/panels of one topic share the one feed, so
+	// Attach this consumer to the shared raw and establish its single feed. The attach (get-or-
+	// create + refCount++) is atomic under rawMu so it cannot race the janitor's reap. The feed is
+	// either the raw's own paho subscription or coverage by a wildcard pattern that enumerated a
+	// view (mutually exclusive; own-sub wins). N views/panels of one topic share the one feed, so
 	// reaping one view never starves the others (the feed lives while refCount > 0).
-	raw.mu.Lock()
-	raw.refCount++
-	raw.detachedAt = time.Time{}
-	ownSub := raw.pahoSubscribed
-	covered := raw.coveredByPattern
-	raw.mu.Unlock()
+	raw, ownSub, covered := c.ensureRawAttached(t, topicPath)
 
 	// Already fed by an own subscription -> every view just rides it.
 	if ownSub {
@@ -862,10 +910,7 @@ func (c *client) Unsubscribe(reqPath string, _ log.Logger) error {
 	if !ok {
 		return nil // No error if topic doesn't exist
 	}
-	raw := t.stream.raw
-	if raw == nil {
-		return nil
-	}
+	raw := t.currentRaw()
 
 	// Detach this consumer from the shared raw but RETAIN the buffer + subscription so a
 	// re-query (e.g. a zoom, which tears down and re-establishes the stream) reseeds recent

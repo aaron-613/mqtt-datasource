@@ -158,9 +158,8 @@ func (t *Topic) ensureStream() {
 	if t.stream == nil {
 		t.stream = &streamState{framer: newFramer(t.Fields...)}
 	}
-	if t.stream.raw == nil {
-		t.stream.raw = newRawTopic(t.Path, 0)
-	}
+	// Note: stream.raw is initialized lazily under stream.mu by currentRaw (and StreamDelta),
+	// never here — reading it unlocked would race Subscribe re-pointing it.
 }
 
 // reconcileFields ensures the topic's framer matches the requested field selection.
@@ -204,28 +203,39 @@ func (t *Topic) Key() string {
 	return path.Join(t.Interval.String(), t.Path, t.StreamingKey)
 }
 
+// currentRaw returns the view's shared raw layer, read under stream.mu because Subscribe may
+// re-point it to a freshly-created raw if the previous one was reaped (see ensureRawAttached).
+func (t *Topic) currentRaw() *rawTopic {
+	t.ensureStream()
+	t.stream.mu.Lock()
+	defer t.stream.mu.Unlock()
+	if t.stream.raw == nil {
+		t.stream.raw = newRawTopic(t.Path, 0)
+	}
+	return t.stream.raw
+}
+
 // appendMessage adds a message to the shared raw ring buffer.
 func (t *Topic) appendMessage(m Message) {
-	t.ensureStream()
-	t.stream.raw.append(m)
+	t.currentRaw().append(m)
 }
 
 // bufferLen returns the number of messages currently in the shared raw buffer.
 func (t *Topic) bufferLen() int {
-	t.ensureStream()
-	t.stream.raw.mu.Lock()
-	defer t.stream.raw.mu.Unlock()
-	return len(t.stream.raw.messages)
+	r := t.currentRaw()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.messages)
 }
 
 // SeedFrame frames the entire retained buffer, for QueryData to seed a panel with
 // recent history (seed-then-stream). It advances the stream watermark to the last
 // seeded message so the subsequent live stream does not re-send seeded rows.
 func (t *Topic) SeedFrame(logger log.Logger) (*data.Frame, error) {
-	t.ensureStream()
 	// Snapshot the shared raw buffer first (releasing raw.mu), then take the view lock for
 	// framer + watermark. The two locks are never held simultaneously.
-	msgs := t.stream.raw.snapshot()
+	raw := t.currentRaw()
+	msgs := raw.snapshot()
 	t.stream.mu.Lock()
 	defer t.stream.mu.Unlock()
 
@@ -242,11 +252,15 @@ func (t *Topic) SeedFrame(logger log.Logger) (*data.Frame, error) {
 func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
 	t.ensureStream()
 	t.stream.mu.Lock()
+	if t.stream.raw == nil {
+		t.stream.raw = newRawTopic(t.Path, 0)
+	}
 	wm := t.stream.watermark
+	raw := t.stream.raw
 	t.stream.mu.Unlock()
 
 	// Read the delta from the shared raw buffer without holding the view lock.
-	delta := t.stream.raw.since(wm)
+	delta := raw.since(wm)
 	if len(delta) == 0 {
 		return nil, false, nil
 	}

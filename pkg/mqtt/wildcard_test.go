@@ -1,12 +1,112 @@
 package mqtt
 
 import (
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/stretchr/testify/require"
 )
+
+// TestSweep_SparesRawReattachedDuringSweep deterministically exercises the F-1 fix: a consumer
+// re-subscribes AFTER the janitor has selected the idle raw as a reap victim but BEFORE the
+// guarded delete. The phase-2 re-check (under rawMu+r.mu) must see the bumped refcount and spare
+// the raw — not delete it or unsubscribe it. Fails if the two-phase re-check is ever removed.
+func TestSweep_SparesRawReattachedDuringSweep(t *testing.T) {
+	fp := &fakePaho{}
+	c := newWildcardTestClient(fp)
+	c.gracePeriod = time.Millisecond
+
+	path := encodeTopic("x/y/z")
+	reqPath := "1s/" + path + "/k"
+
+	// Prime an idle, reap-eligible raw (refCount 0, aged past grace).
+	c.EnsureTopic(&Topic{Path: path, Interval: time.Second, StreamingKey: "k"})
+	_, err := c.Subscribe(reqPath, log.DefaultLogger)
+	require.NoError(t, err)
+	require.NoError(t, c.Unsubscribe(reqPath, log.DefaultLogger))
+	time.Sleep(2 * time.Millisecond)
+
+	// Re-subscribe in the gap between victim selection and the guarded delete.
+	c.sweepAfterScan = func() {
+		c.sweepAfterScan = nil // fire once
+		c.EnsureTopic(&Topic{Path: path, Interval: time.Second, StreamingKey: "k"})
+		if _, err := c.Subscribe(reqPath, log.DefaultLogger); err != nil {
+			t.Error(err)
+		}
+	}
+	c.sweep()
+
+	// The re-attached raw must be spared and fully functional.
+	c.rawMu.RLock()
+	r, ok := c.raws[path]
+	c.rawMu.RUnlock()
+	require.True(t, ok, "re-attached raw must not be reaped mid-sweep")
+	require.Equal(t, 1, r.refCount)
+	require.Empty(t, fp.unsubscribed, "a spared raw must not be unsubscribed")
+	c.HandleMessage(path, []byte(`{"v":1}`))
+	top, ok := c.GetTopic(reqPath)
+	require.True(t, ok, "the view must survive")
+	require.Equal(t, 1, top.bufferLen(), "spared topic is still fed")
+}
+
+// TestSweep_RaceWithReSubscribe is the concurrency-safety guard for the attach/detach/feed/sweep
+// paths: ONE consumer (QueryData→RunStream is serial per channel) churns attach→feed→detach while
+// several janitors sweep. Run with -race — it caught the unlocked stream.raw reads during
+// development. The F-1 TOCTOU itself is fixed structurally (attach and reap serialize on rawMu, so
+// the vulnerable interleaving no longer exists); the deterministic re-check guard is above.
+func TestSweep_RaceWithReSubscribe(t *testing.T) {
+	fp := &fakePaho{}
+	c := newWildcardTestClient(fp)
+	c.gracePeriod = time.Millisecond // idle raws are reap-eligible almost immediately
+
+	path := encodeTopic("x/y/z")
+	reqPath := "1s/" + path + "/k"
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Several janitors sweep continuously to widen the reap-vs-attach window.
+	for j := 0; j < 4; j++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					c.sweep()
+				}
+			}
+		}()
+	}
+
+	// One consumer: attach → feed → assert fed → detach, repeatedly (RunStream lifecycle churn).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20000; i++ {
+			c.EnsureTopic(&Topic{Path: path, Interval: time.Second, StreamingKey: "k"})
+			if _, err := c.Subscribe(reqPath, log.DefaultLogger); err != nil {
+				t.Error(err)
+				return
+			}
+			// While attached (refCount>=1) the raw must be live and fed — never reaped out from under us.
+			c.HandleMessage(path, []byte(`{"v":1}`))
+			if top, ok := c.GetTopic(reqPath); ok && top.bufferLen() == 0 {
+				t.Error("attached topic was orphaned: shared buffer not fed")
+				return
+			}
+			_ = c.Unsubscribe(reqPath, log.DefaultLogger)
+		}
+	}()
+
+	<-done
+	close(stop)
+	wg.Wait()
+}
 
 // fakeMessage implements paho.Message so tests can deliver a message to the client's single
 // default publish handler (dispatch), exactly as paho would for a nil-callback subscription.
