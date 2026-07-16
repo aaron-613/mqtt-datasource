@@ -28,7 +28,7 @@ func TestLive_Diagnostic(t *testing.T) {
 	}
 	uri := envOr("MQTT_URI", "tcp://localhost:1884")
 	topic := envOr("MQTT_TOPIC", "pump/system/pollerA")
-	fields := strings.Split(envOr("MQTT_FIELDS", "stats.totalTimeMs,stats.objectCount"), ",")
+	fields := strings.Split(envOr("MQTT_FIELDS", "stats/totalTimeMs,stats/objectCount"), ",")
 
 	ctx := context.Background()
 	c, err := NewClient(ctx, Options{URI: uri}, backend.DataSourceInstanceSettings{})

@@ -3,16 +3,30 @@ package mqtt
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
+
+// diag turns on verbose subscription/buffer lifecycle tracing (Info level) when MQTT_DIAG is set,
+// for diagnosing view-vs-buffer decoupling (a wildcard/field series freezing while siblings stream).
+// Off by default; adds no overhead beyond a bool check when disabled.
+var diag = os.Getenv("MQTT_DIAG") != ""
+
+// Diag reports whether MQTT_DIAG tracing is enabled (so other packages can gate their own traces).
+func Diag() bool { return diag }
+
+// rawSeq assigns a unique, monotonic id to each rawTopic instance, so a diag trace can tell which
+// buffer instance a view reads vs which one the feed appends to (the tell for a stale-raw pointer).
+var rawSeq uint64
 
 // defaultWindow is how much recent history the ring buffer retains when a topic
 // doesn't specify its own window. maxBufferedMessages is a hard safety cap so a
@@ -31,7 +45,7 @@ type Message struct {
 type Topic struct {
 	Path         string            `json:"topic"`
 	StreamingKey string            `json:"streamingKey,omitempty"`
-	Fields       []string          `json:"fields,omitempty"`       // selected leaf paths (dot notation); empty = classic top-level extraction
+	Fields       []string          `json:"fields,omitempty"`       // selected leaf paths (slash notation); empty = classic top-level extraction
 	FieldAliases map[string]string `json:"fieldAliases,omitempty"` // leaf path -> display-name alias for the legend
 	Filter       string            `json:"filter,omitempty"`       // wildcard substring filter (query-time only)
 	LabelSource  string            `json:"labelSource,omitempty"`  // series-label source: "topic" (default) | "payload" | "custom"
@@ -69,13 +83,19 @@ type rawTopic struct {
 	// of this topic). detachedAt is when it last dropped to 0, for janitor reaping past grace.
 	refCount   int
 	detachedAt time.Time
+
+	id uint64 // unique instance id (diag only): distinguishes buffer instances for the same path
 }
 
 func newRawTopic(path string, window time.Duration) *rawTopic {
 	if window <= 0 {
 		window = defaultWindow
 	}
-	return &rawTopic{path: path, window: window}
+	r := &rawTopic{path: path, window: window, id: atomic.AddUint64(&rawSeq, 1)}
+	if diag {
+		log.DefaultLogger.Info("mqtt-diag raw-created", "path", path, "rawID", r.id)
+	}
+	return r
 }
 
 // append adds a message to the shared ring buffer and trims by window and cap.
@@ -84,6 +104,9 @@ func (r *rawTopic) append(m Message) {
 	defer r.mu.Unlock()
 	r.messages = append(r.messages, m)
 	r.trimLocked(m.Timestamp)
+	if diag {
+		log.DefaultLogger.Info("mqtt-diag feed", "path", r.path, "rawID", r.id, "buf", len(r.messages))
+	}
 }
 
 func (r *rawTopic) trimLocked(now time.Time) {
@@ -267,6 +290,12 @@ func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
 
 	// Read the delta from the shared raw buffer without holding the view lock.
 	delta := raw.since(wm)
+	if diag {
+		raw.mu.Lock()
+		buf := len(raw.messages)
+		raw.mu.Unlock()
+		log.DefaultLogger.Info("mqtt-diag delta", "key", t.Key(), "rawID", raw.id, "buf", buf, "watermark", wm, "deltaN", len(delta))
+	}
 	if len(delta) == 0 {
 		return nil, false, nil
 	}
@@ -279,12 +308,20 @@ func (t *Topic) StreamDelta(logger log.Logger) (*data.Frame, bool, error) {
 	return frame, true, err
 }
 
+// labelSep joins the object and metric dimensions in a composed legend label. It is "/"
+// (no spaces) to keep the label reading like an MQTT topic path (matched segments are also
+// "/"-joined), e.g. "solace1025/rdp-influx-gw/Current Messages".
+const labelSep = "/"
+
 // applyLabels attaches identifying labels and a composed display name to the selected
 // value fields. It models two dimensions: the OBJECT (which matched thing — the series
 // label, from a configurable source) and the METRIC (which field — the per-field alias).
-// The legend composes them: single field -> object label; many fields -> object · metric;
-// no object label -> metric (alias) or the raw field name. Only applied in selection mode
-// so classic-mode golden tests are untouched. Called with the topic's stream lock held.
+// The legend composes them: many fields -> object/metric (metric = alias or last path
+// segment, so each field is distinguishable); single field WITH an explicit alias ->
+// object/alias (the alias shows while the object keeps series distinct); single field
+// with no alias -> object alone (clean default); no object label -> alias or the raw field
+// name. Only applied in selection mode so classic-mode golden tests are untouched. Called
+// with the topic's stream lock held.
 func (t *Topic) applyLabels(frame *data.Frame, msgs []Message) {
 	if frame == nil || len(t.Fields) == 0 {
 		return
@@ -310,18 +347,23 @@ func (t *Topic) applyLabels(frame *data.Frame, msgs []Message) {
 		}
 		f.Labels = labels
 
+		alias := t.FieldAliases[f.Name]
 		var display string
 		switch {
 		case objectLabel == "":
 			// No object dimension: fall back to the metric alias, else the field name.
-			display = t.FieldAliases[f.Name]
+			display = alias
 		case multiField:
-			metric := t.FieldAliases[f.Name]
+			metric := alias
 			if metric == "" {
 				metric = lastSegment(f.Name)
 			}
-			display = objectLabel + " · " + metric
+			display = objectLabel + labelSep + metric
+		case alias != "":
+			// Single field with an explicit alias: compose so the alias shows.
+			display = objectLabel + labelSep + alias
 		default:
+			// Single field, no alias: the object label alone is the clean default.
 			display = objectLabel
 		}
 		if display != "" {
@@ -405,10 +447,10 @@ func stringifyLeaf(v interface{}) string {
 	return ""
 }
 
-// lastSegment returns the final dot-separated segment of a leaf path
-// (e.g. "stats.total-time-ms" -> "total-time-ms").
+// lastSegment returns the final slash-separated segment of a leaf path
+// (e.g. "stats/total-time-ms" -> "total-time-ms").
 func lastSegment(path string) string {
-	if i := strings.LastIndex(path, "."); i >= 0 {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
 		return path[i+1:]
 	}
 	return path

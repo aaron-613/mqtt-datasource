@@ -671,6 +671,9 @@ func (c *client) sweep() {
 		// Drop the reaped raw's views. Only those still pointing at THIS raw — a view that a
 		// concurrent Subscribe already re-pointed to a fresh raw for the same path is live.
 		c.deleteReapedViews(vv.path, r)
+		if diag {
+			log.DefaultLogger.Info("mqtt-diag reap", "path", vv.path, "rawID", r.id)
+		}
 		log.DefaultLogger.Debug("janitor removed idle topic", "path", vv.path)
 	}
 }
@@ -748,6 +751,7 @@ func (c *client) ensureRawAttached(t *Topic, path string) *rawTopic {
 	}
 	raw.mu.Lock()
 	raw.refCount++
+	rc := raw.refCount
 	raw.detachedAt = time.Time{}
 	raw.mu.Unlock()
 	c.rawMu.Unlock()
@@ -755,6 +759,9 @@ func (c *client) ensureRawAttached(t *Topic, path string) *rawTopic {
 	t.stream.mu.Lock()
 	t.stream.raw = raw
 	t.stream.mu.Unlock()
+	if diag {
+		log.DefaultLogger.Info("mqtt-diag attach", "key", t.Key(), "path", path, "rawID", raw.id, "refCount", rc)
+	}
 	return raw
 }
 
@@ -915,7 +922,11 @@ func (c *client) Unsubscribe(reqPath string, _ log.Logger) error {
 	if raw.refCount == 0 {
 		raw.detachedAt = time.Now()
 	}
+	rc := raw.refCount
 	raw.mu.Unlock()
+	if diag {
+		log.DefaultLogger.Info("mqtt-diag detach", "key", reqPath, "path", raw.path, "rawID", raw.id, "refCount", rc)
+	}
 
 	// Release this view's own wildcard-subscription reference (if it was riding one), so that
 	// pattern's shared sub can be reaped once no enumerated series still need it.

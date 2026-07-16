@@ -9,6 +9,8 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+
+	"github.com/grafana/mqtt-datasource/pkg/mqtt"
 )
 
 func (ds *MQTTDatasource) RunStream(ctx context.Context, req *backend.RunStreamRequest, sender *backend.StreamSender) error {
@@ -49,6 +51,9 @@ func (ds *MQTTDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 		case <-ticker.C:
 			topic, ok := ds.Client.GetTopic(topicKey)
 			if !ok {
+				if mqtt.Diag() {
+					logger.Info("mqtt-diag stream-topic-not-found", "topicKey", topicKey)
+				}
 				logger.Debug("topic not found", "path", req.Path, "topicKey", topicKey)
 				break
 			}

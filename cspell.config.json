@@ -50,7 +50,9 @@
     "httpadapter",
     "demux",
     "demuxes",
+    "demuxed",
     "idempotent",
-    "idempotently"
+    "idempotently",
+    "TOCTOU"
   ]
 }

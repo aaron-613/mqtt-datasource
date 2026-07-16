@@ -87,7 +87,7 @@ func (ds *MQTTDatasource) handleTopics(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleFields returns the flattened leaf paths of a discovered topic's sample
-// payload (e.g. stats.total-time-ms), for the field multi-select. Expects the raw
+// payload (e.g. stats/total-time-ms), for the field multi-select. Expects the raw
 // (non-base64) topic as the ?topic= query parameter.
 func (ds *MQTTDatasource) handleFields(w http.ResponseWriter, r *http.Request) {
 	ds.Client.StartDiscovery()

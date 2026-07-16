@@ -5,7 +5,7 @@ export interface MqttQuery extends DataQuery {
   topic?: string;
   stream?: boolean;
   streamingKey?: string;
-  // Selected leaf paths (dot notation, e.g. "stats.totalTimeMs") to extract from the
+  // Selected leaf paths (slash notation, e.g. "stats/totalTimeMs") to extract from the
   // JSON payload. Empty/undefined = classic behavior (every top-level key becomes a field).
   fields?: string[];
   // Optional per-field display-name alias for the legend, keyed by leaf path.

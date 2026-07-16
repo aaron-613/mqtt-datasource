@@ -12,7 +12,7 @@ import (
 )
 
 type framer struct {
-	// selected leaf paths (dot notation, e.g. "stats.totalTimeMs"). When empty the
+	// selected leaf paths (slash notation, e.g. "stats/totalTimeMs"). When empty the
 	// framer falls back to the classic behavior of extracting every top-level key.
 	selected []string
 
@@ -190,11 +190,11 @@ func (df *framer) extendFields(idx int) {
 	}
 }
 
-// lookupPath walks a dot-separated path into a decoded JSON value and returns the
+// lookupPath walks a slash-separated path into a decoded JSON value and returns the
 // leaf. Only object traversal is supported (arrays are treated as leaves/JSON).
-func lookupPath(root interface{}, dotted string) (interface{}, bool) {
+func lookupPath(root interface{}, path string) (interface{}, bool) {
 	cur := root
-	for _, seg := range strings.Split(dotted, ".") {
+	for _, seg := range strings.Split(path, "/") {
 		obj, ok := cur.(map[string]interface{})
 		if !ok {
 			return nil, false
@@ -207,7 +207,7 @@ func lookupPath(root interface{}, dotted string) (interface{}, bool) {
 	return cur, true
 }
 
-// FlattenLeafPaths returns every scalar leaf path (dot notation) found in a JSON
+// FlattenLeafPaths returns every scalar leaf path (slash notation) found in a JSON
 // sample message, sorted. Used by discovery to offer a field pick-list. Objects are
 // descended into; arrays and scalars are treated as leaves.
 func FlattenLeafPaths(payload []byte) ([]string, error) {
@@ -222,7 +222,7 @@ func FlattenLeafPaths(payload []byte) ([]string, error) {
 			for k, child := range obj {
 				next := k
 				if prefix != "" {
-					next = prefix + "." + k
+					next = prefix + "/" + k
 				}
 				walk(next, child)
 			}

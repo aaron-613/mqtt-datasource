@@ -3,6 +3,7 @@ import { Alert, Input, InlineFieldRow, InlineField, TextArea, Combobox, Combobox
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { MqttDataSourceOptions, MqttQuery } from './types';
+import { isWildcard, matchesTopic } from './wildcard';
 
 type Props = QueryEditorProps<DataSource, MqttQuery, MqttDataSourceOptions>;
 
@@ -77,12 +78,12 @@ const ClassicEditor = ({ query, onChange, onRunQuery }: Props) => {
           label="Fields"
           labelWidth={LABEL_WIDTH}
           grow
-          tooltip="Optional. One JSON leaf path per line (dot notation, e.g. stats.totalTimeMs). Leave empty to graph every top-level key."
+          tooltip="Optional. One JSON leaf path per line (slash notation, e.g. stats/totalTimeMs). Leave empty to graph every top-level key."
         >
           <TextArea
             name="fields"
             rows={3}
-            placeholder={'stats.totalTimeMs\nstats.objectCount'}
+            placeholder={'stats/totalTimeMs\nstats/objectCount'}
             defaultValue={(query.fields ?? []).join('\n')}
             onBlur={(e) => {
               onChange({ ...query, fields: parseFields(e.currentTarget.value) });
@@ -99,20 +100,27 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
   const fields = query.fields ?? [];
 
   const { topicDraft, setTopicDraft, commitTopic } = useTopicDraft(query, onChange, onRunQuery);
-  const isWildcard = /[+#]/.test(topicDraft);
+  const topicIsWildcard = isWildcard(topicDraft);
 
   // Keep-alive: while this editor is mounted, ping /topics so the backend keeps the
-  // discovery subscription open (it lapses ~30s after the last ping). The returned count
-  // feeds the hint line below.
-  const [topicCount, setTopicCount] = useState<number | null>(null);
+  // discovery subscription open (it lapses ~30s after the last ping). The returned list
+  // feeds both the total-count hint and the per-pattern "matches N topics" hint below.
+  const [topics, setTopics] = useState<string[] | null>(null);
   const ping = useCallback(async () => {
     try {
-      const topics = await datasource.getResource<string[]>('topics');
-      setTopicCount(topics.length);
+      setTopics(await datasource.getResource<string[]>('topics'));
     } catch {
       // best-effort keep-alive; ignore transient failures
     }
   }, [datasource]);
+
+  // How many discovered topics the typed wildcard pattern would match (intersected with the
+  // committed Filter substring, mirroring the backend queryWildcard pipeline — case-sensitive,
+  // like strings.Contains). null = don't show (concrete topic, or discovery still warming up).
+  const matchCount =
+    topicIsWildcard && topics && topics.length > 0
+      ? topics.filter((t) => matchesTopic(topicDraft, t) && (!query.filter || t.includes(query.filter))).length
+      : null;
 
   useEffect(() => {
     // ping() only setState()s after an await (the /topics fetch), so this is a genuine
@@ -131,9 +139,9 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
     !rootPrefixes.some((p) => topicDraft.startsWith(p));
 
   const loadTopics = async (input: string): Promise<Array<ComboboxOption<string>>> => {
-    const topics = await datasource.getResource<string[]>('topics');
+    const list = await datasource.getResource<string[]>('topics');
     const needle = input.toLowerCase();
-    return toOptions(topics.filter((t) => t.toLowerCase().includes(needle)));
+    return toOptions(list.filter((t) => t.toLowerCase().includes(needle)));
   };
 
   const loadFields = async (input: string): Promise<Array<ComboboxOption<string>>> => {
@@ -245,7 +253,7 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
             onBlur={commitTopic}
           />
         </InlineField>
-        {isWildcard && (
+        {topicIsWildcard && (
           <InlineField label="Filter" labelWidth={8} tooltip="Only graph matching topics whose name contains this text.">
             <Input
               placeholder="substring"
@@ -254,6 +262,11 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
               width={22}
             />
           </InlineField>
+        )}
+        {matchCount !== null && (
+          <span style={{ alignSelf: 'center', marginLeft: 8, whiteSpace: 'nowrap', opacity: 0.75 }}>
+            matches {matchCount} {matchCount === 1 ? 'topic' : 'topics'}
+          </span>
         )}
       </InlineFieldRow>
 
@@ -281,10 +294,10 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
           />
         </InlineField>
         <IconButton name="sync" tooltip="Refresh discovered topics" onClick={ping} />
-        {topicCount !== null && (
+        {topics !== null && (
           <span style={{ alignSelf: 'center', marginLeft: 8, whiteSpace: 'nowrap', opacity: 0.75 }}>
             {rootPrefixes.length > 0 ? `Discovering under ${rootPrefixes.join(', ')} — ` : 'Discovering — '}
-            {topicCount} topics
+            {topics.length} topics
           </span>
         )}
       </InlineFieldRow>
@@ -294,6 +307,7 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
           <InlineField label={i === 0 ? 'Fields' : ' '} labelWidth={LABEL_WIDTH}>
             <Combobox options={loadFields} value={f} onChange={(o) => setFieldAt(i, o?.value)} createCustomValue width={40} />
           </InlineField>
+          <IconButton name="trash-alt" tooltip="Remove field" onClick={() => removeFieldAt(i)} />
           <InlineField label="Alias" labelWidth={7} tooltip="Optional legend name for this field.">
             <Input
               placeholder="(optional)"
@@ -302,7 +316,6 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
               width={24}
             />
           </InlineField>
-          <IconButton name="trash-alt" tooltip="Remove field" onClick={() => removeFieldAt(i)} />
         </InlineFieldRow>
       ))}
 
