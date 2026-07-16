@@ -253,20 +253,22 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	return c, nil
 }
 
-// dispatch is the single default publish handler for all nil-callback subscriptions
-// (discovery roots and wildcard patterns). It fires exactly once per message regardless of
-// how many subscriptions match, so it can safely demux without double-delivery: it updates
-// the discovery registry, records the concrete topic into every matching wildcard seen-set,
-// and — only when a wildcard pattern matches — feeds the per-series ring buffers.
+// dispatch is the single default publish handler for ALL subscriptions — concrete, wildcard, and
+// discovery — which are all made with a nil paho callback. Because no subscription installs an
+// explicit route, paho calls this handler exactly once per delivered message regardless of how
+// many of the client's subscriptions match it, so it can demux without double-delivery or any
+// route "shadowing" the handler. It updates the discovery registry, records the concrete topic
+// into every matching wildcard's seen-set (for enumeration), and feeds the shared ring buffer for
+// that topic's Path — HandleMessage is a no-op when no raw exists, so a concrete topic feeds its
+// own raw and a topic no one graphs is harmlessly ignored.
 func (c *client) dispatch(_ paho.Client, m paho.Message) {
 	topic := m.Topic()
 	payload := m.Payload()
 	if c.discoveryMode {
 		c.recordDiscovered(topic, payload)
 	}
-	if c.recordWildcardSeen(topic) {
-		c.HandleMessage(encodeTopic(topic), payload)
-	}
+	c.recordWildcardSeen(topic)
+	c.HandleMessage(encodeTopic(topic), payload)
 }
 
 // StartDiscovery is the keep-alive for on-demand discovery: the query editor's resource
@@ -888,17 +890,11 @@ func (c *client) openOwnSub(t *Topic, raw *rawTopic, topicPath string, logger lo
 
 	logger.Debug("Subscribing to MQTT topic", "topic", topic)
 
-	if token := c.client.Subscribe(topic, 0, func(_ paho.Client, m paho.Message) {
-		// A concrete subscription installs an explicit paho route, which SHADOWS the default
-		// handler (dispatch) for this exact topic — paho calls the default handler only when no
-		// route matches. So record the topic into any overlapping wildcard pattern's seen-set
-		// here too; otherwise a wildcard panel covering this topic would never enumerate it (its
-		// seen-set is normally filled by dispatch, which never fires while this route exists).
-		c.recordWildcardSeen(m.Topic())
-		// Wrapping HandleMessage gives the correct topicPath for the incoming topic without
-		// having to regex it against + and #. Always feed the shared buffer for the concrete view.
-		c.HandleMessage(topicPath, []byte(m.Payload()))
-	}); token.Wait() && token.Error() != nil {
+	// Nil callback: like every other subscription, this routes through the single default handler
+	// (dispatch), which records the seen-set and feeds this topic's shared buffer. Using nil (no
+	// explicit route) is what keeps overlapping concrete/wildcard subscriptions from shadowing one
+	// another or double-delivering.
+	if token := c.client.Subscribe(topic, 0, nil); token.Wait() && token.Error() != nil {
 		revert()
 		return nil, backend.DownstreamErrorf("error subscribing to MQTT topic %s: %s", topic, token.Error())
 	}

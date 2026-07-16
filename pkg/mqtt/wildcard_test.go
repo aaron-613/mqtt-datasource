@@ -255,11 +255,11 @@ func TestSubscribe_SharedSubRefcountAndSiblingSurvival(t *testing.T) {
 	require.False(t, raw.detachedAt.IsZero(), "raw marked idle once the last consumer detaches")
 }
 
-// TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet guards the overlap bug found in live
-// testing: a concrete panel on a topic that a wildcard panel also covers. The concrete sub's
-// explicit paho route shadows the default dispatch handler for that topic, so the concrete
-// callback must itself record the topic into the overlapping wildcard's seen-set — otherwise the
-// wildcard panel never enumerates a series for it.
+// TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet guards the overlap behavior: a concrete
+// panel on a topic that a wildcard panel also covers. Since all subscriptions are nil-callback and
+// route through the single dispatch handler (no explicit route to shadow it), a delivered message
+// is recorded into the overlapping wildcard's seen-set AND feeds the shared buffer — so the
+// wildcard panel enumerates the topic even though a concrete panel subscribes to it too.
 func TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet(t *testing.T) {
 	fp := &fakePaho{}
 	c := newWildcardTestClient(fp)
@@ -271,15 +271,16 @@ func TestSubscribe_ConcreteFeedsOverlappingWildcardSeenSet(t *testing.T) {
 	_, err := c.Subscribe(reqPath, log.DefaultLogger)
 	require.NoError(t, err)
 	require.Equal(t, []string{"a/b"}, fp.subscribed)
+	require.Empty(t, fp.routes, "concrete subs use a nil callback — no explicit route to shadow dispatch")
 
-	// A broker message arrives on the concrete route (its explicit handler, not dispatch).
-	fp.deliverRoute("a/b", []byte(`{"v":1}`))
+	// A broker message routes through the single default handler.
+	c.deliver("a/b", []byte(`{"v":1}`))
 
 	require.Equal(t, []string{"a/b"}, c.wildcardSeen("a/+"),
-		"a concrete subscription must record its topic into an overlapping wildcard's seen-set")
+		"dispatch records the concrete topic into an overlapping wildcard's seen-set")
 	tp, ok := c.GetTopic(reqPath)
 	require.True(t, ok)
-	require.Equal(t, 1, tp.bufferLen(), "the shared buffer is still fed for the concrete view")
+	require.Equal(t, 1, tp.bufferLen(), "the shared buffer is fed for the concrete view")
 }
 
 // TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard guards scoped coverage across the

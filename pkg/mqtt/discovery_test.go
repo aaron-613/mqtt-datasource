@@ -41,14 +41,6 @@ func (f *fakePaho) Subscribe(topic string, _ byte, cb paho.MessageHandler) paho.
 	return completedToken{}
 }
 
-// deliverRoute invokes the explicit callback registered for an exact topic — mirroring paho
-// routing a message to a concrete subscription's own handler (which shadows the default handler).
-func (f *fakePaho) deliverRoute(topic string, payload []byte) {
-	if cb := f.routes[topic]; cb != nil {
-		cb(nil, fakeMessage{topic: topic, payload: payload})
-	}
-}
-
 func (f *fakePaho) Unsubscribe(topics ...string) paho.Token {
 	f.unsubscribed = append(f.unsubscribed, topics...)
 	return completedToken{}
