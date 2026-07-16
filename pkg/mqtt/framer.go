@@ -112,6 +112,13 @@ func newFramer(selected ...string) *framer {
 	return df
 }
 
+// toFrame builds a data.Frame from the given messages. NOTE: it reuses the framer's own
+// *data.Field slice across calls (cleared at the top and returned inside the frame), so the
+// returned frame ALIASES framer state — it is only valid until the next Seed/Stream call. This is
+// safe today because RunStream calls SendFrame synchronously (the SDK serializes the frame before
+// returning) and SeedFrame/StreamDelta serialize on stream.mu. If any future code RETAINS a
+// returned frame past that window (e.g. buffering frames), copy it first (data.Frame has no deep
+// copy — rebuild fresh fields) or build fresh fields here.
 func (df *framer) toFrame(messages []Message, logger log.Logger) (*data.Frame, error) {
 	// clear the data in the fields
 	for _, field := range df.fields {

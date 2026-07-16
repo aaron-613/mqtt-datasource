@@ -352,6 +352,25 @@ func (c *client) discoveryActiveRoot(filter string) bool {
 	return false
 }
 
+// fifoInsert records topic->val into a FIFO-capped set (a map plus an insertion-order slice),
+// evicting the oldest first-seen topic when at capacity so a newly-appearing topic is admitted.
+// It updates val if the topic is already present. The caller must hold the map's guarding lock
+// (discMu for the discovery registry, wildMu for a wildcard's seen-set). Returns the possibly-
+// reallocated order slice and whether the topic was newly added. Shared by recordDiscovered and
+// recordWildcardSeen so the eviction logic lives in exactly one place.
+func fifoInsert[V any](m map[string]V, order []string, topic string, val V, capacity int) ([]string, bool) {
+	_, existed := m[topic]
+	if !existed {
+		if len(m) >= capacity && len(order) > 0 {
+			delete(m, order[0])
+			order = order[1:]
+		}
+		order = append(order, topic)
+	}
+	m[topic] = val
+	return order, !existed
+}
+
 // recordDiscovered stores the latest sample payload for a concrete topic seen on the
 // discovery subscription, bounded by maxDiscoveredTopics.
 func (c *client) recordDiscovered(topic string, payload []byte) {
@@ -359,17 +378,7 @@ func (c *client) recordDiscovered(topic string, payload []byte) {
 	defer c.discMu.Unlock()
 	sample := make([]byte, len(payload))
 	copy(sample, payload)
-
-	if _, exists := c.discovered[topic]; !exists {
-		if len(c.discovered) >= maxDiscoveredTopics && len(c.discOrder) > 0 {
-			// Evict the oldest first-seen topic so a newly-appearing one is admitted.
-			oldest := c.discOrder[0]
-			c.discOrder = c.discOrder[1:]
-			delete(c.discovered, oldest)
-		}
-		c.discOrder = append(c.discOrder, topic)
-	}
-	c.discovered[topic] = sample
+	c.discOrder, _ = fifoInsert(c.discovered, c.discOrder, topic, sample, maxDiscoveredTopics)
 }
 
 // ListTopics returns the discovered topics, sorted.
@@ -489,15 +498,7 @@ func (c *client) recordWildcardSeen(topic string) bool {
 			continue
 		}
 		matched = true
-		if _, seen := ws.seen[topic]; !seen {
-			if len(ws.seen) >= maxWildcardSeen && len(ws.seenOrder) > 0 {
-				oldest := ws.seenOrder[0]
-				ws.seenOrder = ws.seenOrder[1:]
-				delete(ws.seen, oldest)
-			}
-			ws.seen[topic] = struct{}{}
-			ws.seenOrder = append(ws.seenOrder, topic)
-		}
+		ws.seenOrder, _ = fifoInsert(ws.seen, ws.seenOrder, topic, struct{}{}, maxWildcardSeen)
 	}
 	return matched
 }

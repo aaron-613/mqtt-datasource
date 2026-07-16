@@ -338,6 +338,36 @@ func TestSubscribe_ConcreteNotAbsorbedByOverlappingWildcard(t *testing.T) {
 	})
 }
 
+// TestFifoInsert covers the shared FIFO-capped eviction used by both registries: oldest-out at
+// capacity, in-place update (no reorder/growth) for an existing key, and the "added" flag.
+func TestFifoInsert(t *testing.T) {
+	m := map[string]struct{}{}
+	var order []string
+	for _, tp := range []string{"a", "b", "c"} { // capacity 2 -> "a" evicted
+		var added bool
+		order, added = fifoInsert(m, order, tp, struct{}{}, 2)
+		require.True(t, added)
+	}
+	require.Equal(t, []string{"b", "c"}, order)
+	require.Len(t, m, 2)
+	_, hasA := m["a"]
+	require.False(t, hasA, "oldest first-seen topic is evicted at capacity")
+
+	// Re-inserting an existing key updates in place: not "added", no reorder, no growth.
+	var added bool
+	order, added = fifoInsert(m, order, "b", struct{}{}, 2)
+	require.False(t, added)
+	require.Equal(t, []string{"b", "c"}, order)
+
+	// Values are updated for an existing key.
+	vm := map[string]int{}
+	var vo []string
+	vo, _ = fifoInsert(vm, vo, "x", 1, 5)
+	_, added = fifoInsert(vm, vo, "x", 2, 5)
+	require.False(t, added)
+	require.Equal(t, 2, vm["x"])
+}
+
 func TestWildcard_ClassicUncoveredOpensOwnSub(t *testing.T) {
 	fp := &fakePaho{}
 	c := newWildcardTestClient(fp)
