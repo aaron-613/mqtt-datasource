@@ -368,6 +368,31 @@ func TestFifoInsert(t *testing.T) {
 	require.Equal(t, 2, vm["x"])
 }
 
+// TestRecordWildcardSeen_FastPath covers the read-lock fast path + slow-path insert.
+func TestRecordWildcardSeen_FastPath(t *testing.T) {
+	c := newWildcardTestClient(&fakePaho{})
+
+	// No wildcard subscriptions -> not matched, nothing recorded.
+	require.False(t, c.recordWildcardSeen("a/b"))
+
+	c.wildcards["a/+"] = &wildcardSub{seen: map[string]struct{}{}, pahoSubscribed: true}
+
+	// Matching, new topic -> matched + recorded (slow path).
+	require.True(t, c.recordWildcardSeen("a/b"))
+	require.Equal(t, []string{"a/b"}, c.wildcardSeen("a/+"))
+
+	// Matching, already seen -> matched, no duplicate (fast path, read-lock only).
+	require.True(t, c.recordWildcardSeen("a/b"))
+	require.Equal(t, []string{"a/b"}, c.wildcardSeen("a/+"))
+
+	// Non-matching topic -> not matched.
+	require.False(t, c.recordWildcardSeen("x/y"))
+
+	// An unsubscribed pattern does not match.
+	c.wildcards["a/+"].pahoSubscribed = false
+	require.False(t, c.recordWildcardSeen("a/c"))
+}
+
 func TestWildcard_ClassicUncoveredOpensOwnSub(t *testing.T) {
 	fp := &fakePaho{}
 	c := newWildcardTestClient(fp)

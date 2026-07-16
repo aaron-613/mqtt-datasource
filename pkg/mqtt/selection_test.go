@@ -132,6 +132,24 @@ func TestFlattenLeafPaths(t *testing.T) {
 	require.Equal(t, []string{"hostname", "name", "stats.objectCount", "stats.totalTimeMs"}, paths)
 }
 
+func TestRawTopic_Since(t *testing.T) {
+	base := time.Now()
+	r := newRawTopic("p", time.Hour)
+	// Ascending timestamps; two share base+2s to exercise the equal-timestamp boundary.
+	for i, tm := range []time.Time{
+		base, base.Add(time.Second), base.Add(2 * time.Second), base.Add(2 * time.Second), base.Add(3 * time.Second),
+	} {
+		r.append(Message{Timestamp: tm, Value: []byte{byte(i)}})
+	}
+
+	require.Len(t, r.since(base.Add(-time.Second)), 5, "watermark before all -> all")
+	require.Len(t, r.since(base), 4, "strictly-after excludes the base message")
+	require.Len(t, r.since(base.Add(2*time.Second)), 1, "excludes BOTH equal-timestamp messages")
+	require.Empty(t, r.since(base.Add(3*time.Second)), "watermark == last -> none")
+	require.Empty(t, r.since(base.Add(time.Hour)), "watermark after all -> none")
+	require.Empty(t, newRawTopic("q", time.Hour).since(base), "empty buffer -> none")
+}
+
 func TestTopic_RingBuffer_TrimsByWindow(t *testing.T) {
 	base := time.Now()
 	topic := newStreamTopic("dGVzdA", time.Second, nil, 10*time.Second)

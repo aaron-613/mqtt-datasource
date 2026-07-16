@@ -487,9 +487,12 @@ func (c *client) wildcardSeen(pattern string) []string {
 // it (FIFO-capped per pattern) and reports whether ANY matched — i.e. whether the message
 // should feed the ring buffers. Called from dispatch with the topic decoded.
 func (c *client) recordWildcardSeen(topic string) bool {
-	c.wildMu.Lock()
-	defer c.wildMu.Unlock()
-	matched := false
+	// Fast path under a read lock: this runs for EVERY delivered message. Once a topic is already
+	// in the matching patterns' seen-sets (the steady state), or when there are no wildcard subs
+	// at all (concrete-only graphs, or a discovery firehose matching no pattern), no mutation is
+	// needed — so avoid the write lock and its contention entirely.
+	c.wildMu.RLock()
+	matched, needInsert := false, false
 	for pat, ws := range c.wildcards {
 		if !ws.pahoSubscribed {
 			continue
@@ -498,8 +501,28 @@ func (c *client) recordWildcardSeen(topic string) bool {
 			continue
 		}
 		matched = true
+		if _, seen := ws.seen[topic]; !seen {
+			needInsert = true
+		}
+	}
+	c.wildMu.RUnlock()
+	if !needInsert {
+		return matched
+	}
+
+	// Slow path: a matching pattern hasn't recorded this topic yet. Take the write lock and insert
+	// (re-checking membership, since another goroutine may have inserted in between).
+	c.wildMu.Lock()
+	for pat, ws := range c.wildcards {
+		if !ws.pahoSubscribed {
+			continue
+		}
+		if _, ok := MatchTopic(pat, topic); !ok {
+			continue
+		}
 		ws.seenOrder, _ = fifoInsert(ws.seen, ws.seenOrder, topic, struct{}{}, maxWildcardSeen)
 	}
+	c.wildMu.Unlock()
 	return matched
 }
 

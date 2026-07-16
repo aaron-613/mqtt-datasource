@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,16 +111,20 @@ func (r *rawTopic) snapshot() []Message {
 	return out
 }
 
-// since returns a copy of the messages newer than watermark (for streaming deltas).
+// since returns a copy of the messages strictly newer than watermark (for streaming deltas).
+// Messages are appended in timestamp order, so binary-search the first one after the watermark
+// and copy the tail — O(log n + delta) instead of scanning the whole buffer every tick.
 func (r *rawTopic) since(watermark time.Time) []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var delta []Message
-	for _, m := range r.messages {
-		if m.Timestamp.After(watermark) {
-			delta = append(delta, m)
-		}
+	i := sort.Search(len(r.messages), func(i int) bool {
+		return r.messages[i].Timestamp.After(watermark)
+	})
+	if i >= len(r.messages) {
+		return nil
 	}
+	delta := make([]Message, len(r.messages)-i)
+	copy(delta, r.messages[i:])
 	return delta
 }
 
