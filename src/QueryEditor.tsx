@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Alert, Input, InlineFieldRow, InlineField, TextArea, Combobox, ComboboxOption, IconButton } from '@grafana/ui';
+import { Alert, Button, Input, InlineFieldRow, InlineField, TextArea, Combobox, ComboboxOption, IconButton } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
+import { getTemplateSrv } from '@grafana/runtime';
 import { DataSource } from './datasource';
 import { MqttDataSourceOptions, MqttQuery } from './types';
-import { isWildcard, matchesTopic } from './wildcard';
+import { isWildcard, matchesTopic, matchesFilter } from './wildcard';
 
 type Props = QueryEditorProps<DataSource, MqttQuery, MqttDataSourceOptions>;
 
@@ -108,7 +109,12 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
   const [topics, setTopics] = useState<string[] | null>(null);
   const ping = useCallback(async () => {
     try {
-      setTopics(await datasource.getResource<string[]>('topics'));
+      const list = await datasource.getResource<string[]>('topics');
+      // Only re-render when the list actually changed, so the 10s keep-alive doesn't churn the
+      // editor (and disturb in-progress typing) on every tick.
+      setTopics((prev) =>
+        prev && prev.length === list.length && prev.every((t, i) => t === list[i]) ? prev : list
+      );
     } catch {
       // best-effort keep-alive; ignore transient failures
     }
@@ -117,9 +123,12 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
   // How many discovered topics the typed wildcard pattern would match (intersected with the
   // committed Filter substring, mirroring the backend queryWildcard pipeline — case-sensitive,
   // like strings.Contains). null = don't show (concrete topic, or discovery still warming up).
+  // Resolve dashboard variables so the hint reflects what will actually graph (e.g. a
+  // ${topicFilter} variable in the Filter box), matching applyTemplateVariables' 'csv' format.
+  const resolvedFilter = getTemplateSrv().replace(query.filter ?? '', undefined, 'csv');
   const matchCount =
     topicIsWildcard && topics && topics.length > 0
-      ? topics.filter((t) => matchesTopic(topicDraft, t) && (!query.filter || t.includes(query.filter))).length
+      ? topics.filter((t) => matchesTopic(topicDraft, t) && matchesFilter(t, resolvedFilter)).length
       : null;
 
   useEffect(() => {
@@ -224,6 +233,26 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
     onRunQuery();
   };
 
+  // Append a blank row to type a (not-yet-discovered) path into. It commits — or self-removes if
+  // left empty — on blur (commitFieldAt), so no query runs until there's an actual path.
+  const addBlankField = () => {
+    onChange({ ...query, fields: [...fields, ''] });
+  };
+
+  // Commit a manually-typed field path on blur/Enter. Empty clears the row; unchanged is a no-op
+  // (so tabbing through doesn't re-run the query); otherwise reuse setFieldAt (migrates the alias key).
+  const commitFieldAt = (index: number, raw: string) => {
+    const next = raw.trim();
+    if (!next) {
+      removeFieldAt(index);
+      return;
+    }
+    if (next === fields[index]) {
+      return;
+    }
+    setFieldAt(index, next);
+  };
+
   const onAliasChange = (path: string, alias: string) => {
     const aliases = { ...(query.fieldAliases ?? {}) };
     const trimmed = alias.trim();
@@ -254,12 +283,16 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
           />
         </InlineField>
         {topicIsWildcard && (
-          <InlineField label="Filter" labelWidth={8} tooltip="Only graph matching topics whose name contains this text.">
+          <InlineField
+            label="Filter"
+            labelWidth={10}
+            tooltip="Comma-separated substrings — a topic matches if it contains any of them. Prefix a term with ! to exclude it. Case-sensitive. Supports dashboard variables (e.g. ${topicFilter}); a multi-value variable expands to comma terms."
+          >
             <Input
-              placeholder="substring"
+              placeholder="e.g. include, !exclude"
               defaultValue={query.filter ?? ''}
               onBlur={(e) => onFilterChange(e.currentTarget.value)}
-              width={22}
+              width={26}
             />
           </InlineField>
         )}
@@ -293,6 +326,20 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
             width={50}
           />
         </InlineField>
+        <InlineField
+          label="Field"
+          labelWidth={9}
+          tooltip="Pick a discovered field to add it as a row below. Needs a topic set first."
+        >
+          <Combobox
+            options={loadFields}
+            value={null}
+            onChange={(o) => addField(o?.value)}
+            placeholder={query.topic ? 'add a discovered field…' : 'set a topic first'}
+            width={40}
+            disabled={!query.topic}
+          />
+        </InlineField>
         <IconButton name="sync" tooltip="Refresh discovered topics" onClick={ping} />
         {topics !== null && (
           <span style={{ alignSelf: 'center', marginLeft: 8, whiteSpace: 'nowrap', opacity: 0.75 }}>
@@ -303,12 +350,24 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
       </InlineFieldRow>
 
       {fields.map((f, i) => (
-        <InlineFieldRow key={`${f}-${i}`}>
-          <InlineField label={i === 0 ? 'Fields' : ' '} labelWidth={LABEL_WIDTH}>
-            <Combobox options={loadFields} value={f} onChange={(o) => setFieldAt(i, o?.value)} createCustomValue width={40} />
+        // Keyed by index+value: stable while typing (value only changes on blur-commit, so no
+        // remount mid-type), but remounts with the right defaultValue on add/remove/commit.
+        <InlineFieldRow key={`${i}-${f}`}>
+          <InlineField
+            label={i === 0 ? 'Fields' : ' '}
+            labelWidth={LABEL_WIDTH}
+            tooltip="JSON leaf path (slash notation), e.g. stats/total-time-ms — type it, or use the Field browser above to add a discovered one."
+          >
+            <Input
+              placeholder="e.g. stats/total-time-ms"
+              defaultValue={f}
+              onKeyDown={commitOnEnter}
+              onBlur={(e) => commitFieldAt(i, e.currentTarget.value)}
+              width={40}
+            />
           </InlineField>
           <IconButton name="trash-alt" tooltip="Remove field" onClick={() => removeFieldAt(i)} />
-          <InlineField label="Alias" labelWidth={7} tooltip="Optional legend name for this field.">
+          <InlineField label="Alias" labelWidth={9} tooltip="Optional legend name for this field.">
             <Input
               placeholder="(optional)"
               defaultValue={query.fieldAliases?.[f] ?? ''}
@@ -321,13 +380,9 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
 
       <InlineFieldRow>
         <InlineField label={fields.length === 0 ? 'Fields' : ' '} labelWidth={LABEL_WIDTH}>
-          <Combobox
-            options={loadFields}
-            value={null}
-            onChange={(o) => addField(o?.value)}
-            placeholder={query.topic ? '+ add field' : 'set a topic first'}
-            width={40}
-          />
+          <Button variant="secondary" fill="text" icon="plus" onClick={addBlankField}>
+            Add field
+          </Button>
         </InlineField>
       </InlineFieldRow>
 
@@ -340,8 +395,8 @@ const DiscoveryEditor = ({ query, onChange, onRunQuery, datasource }: Props) => 
           <Combobox options={LABEL_SOURCES} value={labelSource} onChange={onLabelSourceChange} width={18} />
         </InlineField>
         <InlineField
-          label=""
-          labelWidth={1}
+          label="Value"
+          labelWidth={9}
           grow
           tooltip="Topic: level indices (0-based; negatives from the end); blank = the wildcard-matched level(s). Payload: a field path. Custom: a literal string."
         >

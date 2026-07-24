@@ -79,3 +79,40 @@ func MatchTopic(pattern, topic string) (matched string, ok bool) {
 	}
 	return strings.Join(segments, "/"), true
 }
+
+// MatchesFilter reports whether a concrete topic passes a comma-separated include/exclude
+// filter (case-sensitive substring matching). Each comma term is an INCLUDE unless it starts
+// with "!", which makes it an EXCLUDE. A topic passes iff it contains NONE of the excludes AND
+// (there are no includes, or it contains AT LEAST ONE include). An empty filter passes everything.
+// Examples: "!prod" (all but prod); "a,b" (contains a OR b); "a,!b" (contains a AND not b).
+// This is mirrored byte-for-byte by matchesFilter() in src/wildcard.ts — keep them in sync.
+func MatchesFilter(topic, filter string) bool {
+	var includes, excludes []string
+	for _, term := range strings.Split(filter, ",") {
+		term = strings.TrimSpace(term)
+		if term == "" {
+			continue
+		}
+		if strings.HasPrefix(term, "!") {
+			if e := strings.TrimSpace(term[1:]); e != "" {
+				excludes = append(excludes, e)
+			}
+			continue
+		}
+		includes = append(includes, term)
+	}
+	for _, e := range excludes {
+		if strings.Contains(topic, e) {
+			return false
+		}
+	}
+	if len(includes) == 0 {
+		return true
+	}
+	for _, in := range includes {
+		if strings.Contains(topic, in) {
+			return true
+		}
+	}
+	return false
+}

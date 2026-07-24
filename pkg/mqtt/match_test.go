@@ -110,3 +110,26 @@ func TestIsWildcard(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchesFilter(t *testing.T) {
+	for _, c := range []struct {
+		topic, filter string
+		want          bool
+	}{
+		{"host/emeaperf2", "", true},                    // empty filter passes everything
+		{"host/emeaperf2", "!emeaperf2", false},         // exclude
+		{"host/emeaperf3", "!emeaperf2", true},          // exclude doesn't hit
+		{"host/emeaperf3", "emeaperf3,emeaperf4", true}, // include OR
+		{"host/emeaperf4", "emeaperf3,emeaperf4", true},
+		{"host/emeaperf2", "emeaperf3,emeaperf4", false},     // no include matches
+		{"host/emeaperf2/x", "emeaperf,!emeaperf2", false},   // include hits but exclude also hits
+		{"host/emeaperf3/x", "emeaperf,!emeaperf2", true},    // include hits, exclude misses
+		{"host/emeaperf2", "!", true},                        // lone "!" is an empty exclude, ignored
+		{"host/emeaperf2", " emeaperf2 , !nope ", true},      // whitespace trimmed
+		{"host/EMEAPERF2", "emeaperf2", false},               // case-sensitive
+	} {
+		if got := MatchesFilter(c.topic, c.filter); got != c.want {
+			t.Errorf("MatchesFilter(%q, %q) = %v, want %v", c.topic, c.filter, got, c.want)
+		}
+	}
+}

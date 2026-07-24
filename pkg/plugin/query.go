@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
-	"strings"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -107,7 +106,7 @@ func (ds *MQTTDatasource) queryWildcard(t *mqtt.Topic, pattern string) backend.D
 		if !ok {
 			continue
 		}
-		if t.Filter != "" && !strings.Contains(concrete, t.Filter) {
+		if !mqtt.MatchesFilter(concrete, t.Filter) {
 			continue
 		}
 		matches = append(matches, candidate{concrete, matched})

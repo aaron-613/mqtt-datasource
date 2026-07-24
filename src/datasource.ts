@@ -52,14 +52,21 @@ export class DataSource extends DataSourceWithBackend<MqttQuery, MqttDataSourceO
   }
 
   applyTemplateVariables(query: MqttQuery, scopedVars: ScopedVars, filters?: any[]): MqttQuery {
-    let resolvedTopic = getTemplateSrv().replace(query.topic, scopedVars);
-    resolvedTopic = this.base64UrlSafeEncode(resolvedTopic);
+    const srv = getTemplateSrv();
     const resolvedQuery: MqttQuery = {
       ...query,
-      topic: resolvedTopic,
       refId: query.refId,
+      topic: this.base64UrlSafeEncode(srv.replace(query.topic, scopedVars)),
     };
-
+    // Interpolate the free-text query fields too, so dashboard variables work in them.
+    if (query.filter) {
+      // 'csv' format so a multi-value variable expands to comma-separated terms — which is exactly
+      // the include/exclude filter's own syntax (so a multi-select var becomes an OR of includes).
+      resolvedQuery.filter = srv.replace(query.filter, scopedVars, 'csv');
+    }
+    if (query.labelValue) {
+      resolvedQuery.labelValue = srv.replace(query.labelValue, scopedVars);
+    }
     return resolvedQuery;
   }
 

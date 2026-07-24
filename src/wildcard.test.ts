@@ -1,4 +1,4 @@
-import { isWildcard, matchesTopic } from './wildcard';
+import { isWildcard, matchesTopic, matchesFilter } from './wildcard';
 
 describe('isWildcard', () => {
   it.each([
@@ -46,5 +46,23 @@ describe('matchesTopic', () => {
     ],
   ])('matchesTopic(%p, %p) === %p', (pattern, topic, expected) => {
     expect(matchesTopic(pattern, topic)).toBe(expected);
+  });
+});
+
+describe('matchesFilter', () => {
+  it.each([
+    ['host/two', '', true], // empty filter passes everything
+    ['host/two', '!two', false], // exclude
+    ['host/three', '!two', true], // exclude doesn't hit
+    ['host/two', 'two,three', true], // include OR
+    ['host/three', 'two,three', true],
+    ['host/one', 'two,three', false], // no include matches
+    ['host/two/edge', 'edge,!two', false], // include hits but exclude also hits
+    ['host/three/edge', 'edge,!two', true], // include hits, exclude misses
+    ['host/two', '!', true], // lone "!" is an empty exclude, ignored
+    ['host/two', ' two , !nope ', true], // whitespace trimmed
+    ['host/Two', 'two', false], // case-sensitive
+  ])('matchesFilter(%p, %p) === %p', (topic, filter, expected) => {
+    expect(matchesFilter(topic, filter)).toBe(expected);
   });
 });

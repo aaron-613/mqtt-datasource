@@ -41,3 +41,34 @@ export const matchesTopic = (pattern: string, topic: string): boolean => {
   // No trailing '#': the topic must have exactly as many levels as the filter.
   return pp.length === tp.length;
 };
+
+// matchesFilter reports whether a concrete topic passes a comma-separated include/exclude filter
+// (case-sensitive substring matching). Each comma term is an INCLUDE unless it starts with "!",
+// which makes it an EXCLUDE. A topic passes iff it contains NONE of the excludes AND (there are no
+// includes, or it contains AT LEAST ONE include). An empty filter passes everything.
+// Mirrors MatchesFilter() in pkg/mqtt/match.go byte-for-byte — keep them in sync.
+export const matchesFilter = (topic: string, filter: string): boolean => {
+  const includes: string[] = [];
+  const excludes: string[] = [];
+  for (const raw of filter.split(',')) {
+    const term = raw.trim();
+    if (!term) {
+      continue;
+    }
+    if (term.startsWith('!')) {
+      const e = term.slice(1).trim();
+      if (e) {
+        excludes.push(e);
+      }
+      continue;
+    }
+    includes.push(term);
+  }
+  if (excludes.some((e) => topic.includes(e))) {
+    return false;
+  }
+  if (includes.length === 0) {
+    return true;
+  }
+  return includes.some((i) => topic.includes(i));
+};
